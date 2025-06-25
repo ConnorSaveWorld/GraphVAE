@@ -11,11 +11,11 @@ import os
 import pickle as pkl
 import scipy.sparse as sp
 import warnings
-
+import pandas as pd
 import dgl as dgl
 
 import ogb
-
+import pickle
 
 def parse_index_file(filename):
     index = []
@@ -149,6 +149,12 @@ class Datasets():
 
         """
         'Initialization'
+        self.num_views = len(list_adjs[0]) if list_adjs and isinstance(list_adjs[0], list) else 1
+        
+        if self.num_views > 1:
+            print(f"Dataset initialized with {self.num_views} views per graph.")
+
+
         if Max_num!=0 and Max_num!=None:
             list_adjs, graphlabels, list_Xs = self.remove_largergraphs( list_adjs, graphlabels, list_Xs, Max_num)
         self.set_diag_of_isol_Zer = set_diag_of_isol_Zer
@@ -158,28 +164,44 @@ class Datasets():
         self.list_adjs = list_adjs
         self.toatl_num_of_edges = 0
         self.max_num_nodes = 0
-        for i, adj in enumerate(list_adjs):
-            list_adjs[i] =  adj - sp.dia_matrix((adj.diagonal()[np.newaxis, :], [0]), shape=adj.shape)
-            list_adjs[i] += sp.eye(list_adjs[i].shape[0])
-            if self.max_num_nodes < adj.shape[0]:
-                self.max_num_nodes = adj.shape[0]
-            self.toatl_num_of_edges += adj.sum().item()
+        for i, multi_view_adj in enumerate(list_adjs):
+            current_views = multi_view_adj if self.num_views > 1 else [multi_view_adj]
+            if self.max_num_nodes < current_views[0].shape[0]:
+                self.max_num_nodes = current_views[0].shape[0]
+
+            for v_idx in range(len(current_views)):
+                adj = current_views[v_idx]
+                adj =  adj - sp.dia_matrix((adj.diagonal()[np.newaxis, :], [0]), shape=adj.shape)
+                adj += sp.eye(adj.shape[0])
+                self.toatl_num_of_edges += adj.sum().item()
+                if self.num_views > 1:
+                    list_adjs[i][v_idx] = adj
+                else:
+                    list_adjs[i] = adj
+            # list_adjs[i] =  adj - sp.dia_matrix((adj.diagonal()[np.newaxis, :], [0]), shape=adj.shape)
+            # list_adjs[i] += sp.eye(list_adjs[i].shape[0])
+            # if self.max_num_nodes < adj.shape[0]:
+            #     self.max_num_nodes = adj.shape[0]
+            # self.toatl_num_of_edges += adj.sum().item() #update
+
+
             # if list_Xs!=None:
             #     self.list_adjs[i], list_Xs[i] = self.permute(list_adjs[i], list_Xs[i])
             # else:
             #     self.list_adjs[i], _ = self.permute(list_adjs[i], None)
-        if Max_num!=None:
-            self.max_num_nodes = Max_num
-        self.processed_Xs = []
-        self.processed_adjs = []
-        self.num_of_edges = []
-        # for i in range(len(self.list_Xs)):
-        for i in range(self.__len__()):
-            a,x,n,_ = self.process(i,self_for_none)
-            self.processed_Xs.append(x)
-            self.processed_adjs.append(a)
-            self.num_of_edges.append(n)
-        self.feature_size = self.processed_Xs[0].shape[-1]
+        # if Max_num!=None:
+        #     self.max_num_nodes = Max_num
+        # self.processed_Xs = []
+        # self.processed_adjs = []
+        # self.num_of_edges = []
+        # # for i in range(len(self.list_Xs)):
+        # for i in range(self.__len__()):
+        #     a,x,n,_ = self.process(i,self_for_none)
+        #     self.processed_Xs.append(x)
+        #     self.processed_adjs.append(a)
+        #     self.num_of_edges.append(n)
+        self.feature_size = 0 
+        # self.feature_size = self.processed_Xs[0].shape[-1]
         self.adj_s= []
         self.x_s = []
         self.num_nodes = []
@@ -187,19 +209,38 @@ class Datasets():
 
         self.featureList = None
 
+        
+
   def remove_largergraphs(self, adjs, labels, Xs, max_size):
       processed_adjs = []
       processed_labels = []
       processed_Xs=[]
 
+      if not adjs: # Handle empty list
+        print("adjs is empty")
+        return [], [], []
+      is_multi_view = isinstance(adjs[0], list)
+
       for i in range(len(adjs)):
-          if adjs[i].shape[0]<=max_size:
-              processed_adjs.append(adjs[i])
-              if labels!=None:
-                  processed_labels.append(labels[i])
-              if Xs!=None:
-                  processed_Xs.append(Xs[i])
-      return processed_adjs,processed_labels,processed_Xs
+          if is_multi_view:
+            # For multi-view graphs, check the shape of the first view
+            shape_to_check = adjs[i][0].shape
+          else:
+            # For single-view graphs, check the shape directly
+            shape_to_check = adjs[i].shape
+
+          if shape_to_check[0] <= max_size:
+            processed_adjs.append(adjs[i])
+            if labels is not None:
+                processed_labels.append(labels[i])
+            if Xs is not None:
+                processed_Xs.append(Xs[i])
+                
+    # Handle the case where the labels/features list might have been None initially
+      final_labels = processed_labels if labels is not None else None
+      final_Xs = processed_Xs if Xs is not None else None
+    
+      return processed_adjs, final_labels, final_Xs
   def get(self):
       indexces = list(range(self.__len__()))
       return [self.processed_adjs[i] for i in indexces], [self.processed_Xs[i] for i in indexces]
@@ -213,27 +254,20 @@ class Datasets():
       return self.adj_s
 
   def get__(self,from_, to_, self_for_none, bfs=None, ignore_isolate_nodes = False):
-      adj_s = []
-      x_s = []
-      num_nodes = []
-      subgraph_indexes = []
-      # padded_to = max([self.list_adjs[i].shape[1] for i in range(from_, to_)])
-      # padded_to = 225
-      if bfs==None:
-          graphfeatures = []
-          for element in self.featureList:
-              graphfeatures.append(element[from_:to_])
-          return self.adj_s[from_:to_], self.x_s[from_:to_], self.num_nodes[from_:to_], self.subgraph_indexes[from_:to_], graphfeatures
+    adj_s_batch = self.adj_s[from_:to_]
+    x_s_batch = self.x_s[from_:to_]
+    num_nodes_batch = self.num_nodes[from_:to_]
+    subgraph_indexes_batch = self.subgraph_indexes[from_:to_]
 
-      for i in range(from_, to_):
-          # bfs = self.max_num_nodes
-          adj, x, num_node, indexes = self.process(i, self_for_none,None, bfs, ignore_isolate_nodes)#, padded_to)
-          adj_s.append(adj)
-          x_s.append(x)
-          num_nodes.append(num_node)
-          subgraph_indexes.append(indexes)
-
-      return adj_s, x_s, num_nodes, subgraph_indexes
+    # Handle the kernel features (target_kelrnel_val)
+    # Only process this if featureList is not None.
+    graphfeatures_batch = []
+    if self.featureList is not None:
+        for element in self.featureList:
+            # Assuming element is a list/array of features for all graphs
+            graphfeatures_batch.append(element[from_:to_])
+    
+    return adj_s_batch, x_s_batch, num_nodes_batch, subgraph_indexes_batch, graphfeatures_batch
 
 
   def get_max_degree(self):
@@ -246,117 +280,99 @@ class Datasets():
       # padded_to = max([self.list_adjs[i].shape[1] for i in range(from_, to_)])
       # padded_to = 225
 
-      from_ = 0
-      to_ = len(self.list_adjs)
-      for i in range(from_, to_):
-          # bfs = self.max_num_nodes
-          adj, x, num_node, indexes = self.process(i, self_for_none,None, bfs, ignore_isolate_nodes)#, padded_to)
-          self.adj_s.append(adj)
-          self.x_s.append(x)
-          self.num_nodes.append(num_node)
-          self.subgraph_indexes.append(indexes)
+      if not self.list_adjs: # Handle empty dataset
+        print("list_adjs is null")
+        return
+
+      for i in range(len(self.list_adjs)):
+        adj_views_tensor, x, num_node, indexes = self.process(
+            i, self_for_none, None, bfs, ignore_isolate_nodes
+        )
+        self.adj_s.append(adj_views_tensor)
+        self.x_s.append(x)
+        self.num_nodes.append(num_node)
+        self.subgraph_indexes.append(indexes)
+
+      if self.x_s:
+        self.feature_size = self.x_s[0].shape[-1]
+      else:
+        self.feature_size = 0
 
   def __len__(self):
         'Denotes the total number of samples'
         return len(self.list_adjs)
 
-  def process(self,index,self_for_none, padded_to=None, bfs_max_length = None, ignore_isolate_nodes=True):
-      # self.featureList = None
+  # In data.py, inside the Datasets class
 
-      if bfs_max_length!=None:
-        bfs_max_length = min(bfs_max_length, self.max_num_nodes)
+  def process(self, index, self_for_none, padded_to=None, bfs_max_length=None, ignore_isolate_nodes=True):
+    """
+    Processes a single graph sample (either single or multi-view) from the raw data list.
+    Returns padded tensor representations for adjacencies and features.
+    """
+    
+    # --- Step 1: Standardize input to be a list of views ---
+    is_multi_view = isinstance(self.list_adjs[index], list)
+    adj_views_list = self.list_adjs[index] if is_multi_view else [self.list_adjs[index]]
+    
+    # --- Step 2: Determine graph and padding dimensions ---
+    num_nodes = adj_views_list[0].shape[0] # Get shape from the first view
 
-      num_nodes = self.list_adjs[index].shape[0]
-      if self.paading == True:
-          max_num_nodes = self.max_num_nodes if padded_to==None else padded_to
-      else:
-          max_num_nodes = num_nodes
-      adj_padded = lil_matrix((max_num_nodes,max_num_nodes)) # make the size equal to maximum graph
-      if max_num_nodes==num_nodes:
-          adj_padded = lil_matrix(self.list_adjs[index], dtype=np.int8)
-      else:
-        adj_padded[:num_nodes, :num_nodes] = self.list_adjs[index][:, :]
-      # adj_padded -= sp.dia_matrix((adj_padded.diagonal()[np.newaxis, :], [0]), shape=adj_padded.shape)
-      adj_padded.setdiag(0)
-      nodeDegree = adj_padded.sum(-1)
-      if not ignore_isolate_nodes:
-          nodeDegree+=1
+    if self.paading:
+        max_num_nodes = self.max_num_nodes if padded_to is None else padded_to
+    else:
+        max_num_nodes = num_nodes
 
-      if self_for_none:
-          adj_padded.setdiag(1)
-      else:
-          if max_num_nodes != num_nodes:
-              adj_padded[:num_nodes, :num_nodes] += sp.eye(num_nodes)
-          else:
-              adj_padded += sp.eye(num_nodes)
-      # adj_padded+= sp.eye(max_num_nodes)
+    # --- Step 3: Process Adjacency Matrices ---
+    num_views = len(adj_views_list)
+    padded_adj_views = torch.zeros(num_views, max_num_nodes, max_num_nodes)
 
+    for v_idx in range(num_views):
+        adj_view_sparse = adj_views_list[v_idx]
+        adj_padded = lil_matrix((max_num_nodes, max_num_nodes))
+        adj_padded[:num_nodes, :num_nodes] = adj_view_sparse[:, :]
+        
+        adj_padded.setdiag(0) # Remove existing self-loops
 
+        if self_for_none:
+            adj_padded.setdiag(1)
+        else:
+            adj_padded[:num_nodes, :num_nodes] += sp.eye(num_nodes)
+            
+        padded_adj_views[v_idx] = torch.tensor(adj_padded.toarray(), dtype=torch.float32)
 
-      if type(self.list_Xs[index]) != np.ndarray:
-          # if the feature is not exist we use identical matrix
-          # X = np.identity( max_num_nodes)
-          diag = np.ones(max_num_nodes)
-          if (self.set_diag_of_isol_Zer==True):
-            diag[num_nodes:]=0
-          X = np.identity( max_num_nodes)
-          np.fill_diagonal(X, diag)
+    # If the original data was single-view, remove the unnecessary view dimension.
+    if not is_multi_view:
+        padded_adj_views = padded_adj_views.squeeze(0)
 
-          featureVec = np.array(adj_padded.sum(1)) / max_num_nodes
-          X= numpy.concatenate([X,featureVec], 1)
+    # --- Step 4: Process Node Features ---
+    if self.list_Xs and self.list_Xs[index] is not None:
+        # If features are provided
+        X_unpadded = self.list_Xs[index]
+        feature_dim = X_unpadded.shape[1]
+        X = np.zeros((max_num_nodes, feature_dim))
+        X[:num_nodes, :] = X_unpadded
+    else:
+        # If no features, create default ones (identity + degree)
+        first_view_padded = lil_matrix(padded_adj_views[0].numpy() if is_multi_view else padded_adj_views.numpy())
+        
+        identity_features = np.identity(max_num_nodes)
+        degree_features = np.array(first_view_padded.sum(axis=1))
+        
+        # Normalize degree features
+        if degree_features.sum() > 0:
+            degree_features = degree_features / degree_features.sum()
 
-          # # X = adj_padded.sum(-1)
-          # X = np.concatenate((np.identity( max_num_nodes),adj_padded.sum(-1)),1)
-      else:
-          #ToDo: deal with data with diffrent number of nodes
-          X = self.list_Xs[index]
+        X = np.concatenate([identity_features, degree_features], axis=1)
 
-      # adj_padded, X = self.permute(adj_padded, X)
+    X = torch.tensor(X, dtype=torch.float32)
 
-      # # Converting sparse matrix to sparse tensor
-      # coo = adj_padded.tocoo()
-      # values = coo.data
-      # indices = np.vstack((coo.row, coo.col))
-      # i = torch.LongTensor(indices)
-      # v = torch.FloatTensor(values)
-      # shape = coo.shape
-      # adj_padded = torch.sparse.FloatTensor(i, v, torch.Size(shape)).to_dense()
-      X = torch.tensor(X).float()
-      # adj_padded, X = permute([adj_padded], [X])
-      # adj_padded = adj_padded[0]
-      # X = X[0]
-      bfs_indexes =set()
-      if bfs_max_length!=None:
-          while(len(bfs_indexes)<bfs_max_length):
-              indexes = set(range(adj_padded.shape[0])).difference(bfs_indexes).difference(np.where(nodeDegree==0)[0])
+    # --- Step 5: Finalize and Return ---
+    # The actual BFS permutation should happen *before* calling this method.
+    # This method just needs to return the node indices being used.
+    # For now, we assume the whole (padded) graph is used.
+    final_indices = list(range(max_num_nodes))
 
-              source_indx = list(indexes)[np.random.randint(len(indexes))]
-              bfs_index = scipy.sparse.csgraph.breadth_first_order(adj_padded, source_indx)
-              portionSize = min(len(bfs_index[0]),int(bfs_max_length/5))
-              if (portionSize+len(bfs_indexes)>=bfs_max_length):
-                  bfs_indexes =bfs_indexes.union(bfs_index[0][:(bfs_max_length-len(bfs_indexes))])
-              else:
-                  bfs_indexes = bfs_indexes.union(bfs_index[0][:portionSize])
-          bfs_indexes = list(bfs_indexes)
-
-      if len(bfs_indexes)==0:
-          bfs_indexes = list(range(max_num_nodes))
-
-          # nodeDegree = adj_padded.sum(-1)
-          # indexes = set(range(adj_padded.shape[0]))
-          # non_isolate_nodes = list(set(range(adj_padded.shape[0])).difference(np.where(nodeDegree<2)[0]))
-          # source_indx = non_isolate_nodes[np.random.randint(len(non_isolate_nodes))]
-          # bfs_indexes = scipy.sparse.csgraph.breadth_first_order(adj_padded, source_indx)
-          # bfs_indexes = np.concatenate((bfs_indexes[0],np.where(nodeDegree<2)[0]))
-      # none_selected = set(range(adj_padded.shape[0])).difference(set(bfs_indexes))
-
-      # index = bfs_indexes + list(none_selected)
-      # adj_padded= adj_padded[:,index]
-      # adj_padded = adj_padded[index, :]
-      # X = X[:,index]
-      # X = X[index, :]
-
-      return adj_padded, X, num_nodes,bfs_indexes
+    return padded_adj_views, X, num_nodes, final_indices
   # def process(self,index,self_for_none, padded_to=None,):
   #
   #     num_nodes = self.list_adjs[index].shape[0]
@@ -464,7 +480,10 @@ def list_graph_loader( graph_type, _max_list_size=None, return_labels=False, lim
   list_x =[]
   list_labels = []
 
-  if graph_type=="IMDBBINARY":
+  if graph_type == "Multi":
+    list_adj, list_x, list_labels = load_neuroimaging_data("/home/jinghu/diffusion/testDiff/GraphVAE-MM/dataset/Multi")
+
+  elif graph_type=="IMDBBINARY":
       data = dgl.data.GINDataset(name='IMDBBINARY', self_loop=False)
       graphs, labels = data.graphs, data.labels
       for i, graph in enumerate(graphs):
@@ -641,6 +660,9 @@ def list_graph_loader( graph_type, _max_list_size=None, return_labels=False, lim
           list_labels.append(g_type)
       # graphs_to_writeOnDisk = [gr.toarray() for gr in list_adj]
       # np.save('PVGAErandomGraphs.npy', graphs_to_writeOnDisk, allow_pickle=True)
+
+
+    
 
   # elif graph_type == "PVGAErandomGraphs_10000":
   #     for i in range(10000):
@@ -851,9 +873,46 @@ def data_split(graph_lis, list_x=None, list_label=None):
 # list_graph = Datasets(list_adj,self_for_none, None)
 
 def BFS(list_adj):
-    for i, _ in enumerate(list_adj):
-        bfs_index = scipy.sparse.csgraph.breadth_first_order(list_adj[i],0)
-        list_adj[i] =list_adj[i][bfs_index[0],:][:,bfs_index[0]]
+    if not list_adj:
+        return list_adj
+
+    # Check if the data is multi-view
+    is_multi_view = isinstance(list_adj[0], list)
+
+    for i in range(len(list_adj)):
+        if is_multi_view:
+            # For multi-view, compute BFS order on the first view (e.g., SC matrix)
+            # and apply the same order to all views for that subject.
+            first_view = list_adj[i][0]
+            
+            # Find a starting node that is not an isolate
+            degrees = np.array(first_view.sum(axis=1)).flatten()
+            potential_starters = np.where(degrees > 0)[0]
+            if len(potential_starters) == 0:
+                # If all nodes are isolated, just continue, no permutation needed
+                continue
+            start_node = random.choice(potential_starters)
+
+            bfs_index = scipy.sparse.csgraph.breadth_first_order(first_view, start_node, return_predecessors=False)
+            
+            # Apply the same permutation to all views of this graph
+            for v_idx in range(len(list_adj[i])):
+                view_matrix = list_adj[i][v_idx]
+                permuted_view = view_matrix[bfs_index, :][:, bfs_index]
+                list_adj[i][v_idx] = permuted_view
+        else:
+            # Original logic for single-view graphs
+            single_view_graph = list_adj[i]
+            
+            degrees = np.array(single_view_graph.sum(axis=1)).flatten()
+            potential_starters = np.where(degrees > 0)[0]
+            if len(potential_starters) == 0:
+                continue
+            start_node = random.choice(potential_starters)
+
+            bfs_index = scipy.sparse.csgraph.breadth_first_order(single_view_graph, start_node, return_predecessors=False)
+            list_adj[i] = single_view_graph[bfs_index, :][:, bfs_index]
+            
     return list_adj
 
 def BFSWithAug(list_adj,X_s, label_s, number_of_per = 1):
@@ -943,6 +1002,75 @@ def BFS_Permute( adj_s, x_s, target_kelrnel_val):
 
 
   return adj_s, x_s, target_kelrnel_val
+
+def load_neuroimaging_data(data_path):#new
+    """
+    Loads multi-view neuroimaging data (SC, FC) and multi-label CSV.
+
+    Args:
+        data_path (str): The directory containing sc.pkl, fc.pkl, and labels.csv.
+
+    Returns:
+        tuple: A tuple containing:
+            - list_adj (list): A list of multi-view graphs. Each element is [sc_matrix, fc_matrix].
+            - list_x (list): A list of None, as there are no node features.
+            - list_labels (list): A list of multi-label numpy arrays.
+    """
+    print("Loading Multi-view Neuroimaging Dataset...")
+
+    # 1. Load the pickle files
+    try:
+        with open(os.path.join(data_path, 'sc_site_16.pkl'), 'rb') as f:
+            sc_data = pickle.load(f)
+        with open(os.path.join(data_path, 'fc_site_16.pkl'), 'rb') as f:
+            fc_data = pickle.load(f)
+    except FileNotFoundError as e:
+        print(f"Error: Could not find SC or FC pickle files in '{data_path}'.")
+        raise e
+
+    # 2. Load the labels CSV
+    try:
+        labels_df = pd.read_csv(os.path.join(data_path, 'site_16_labels.csv'))
+        # Set the subjectkey as the index for easy lookup
+        labels_df.set_index('subjectkey', inplace=True)
+    except FileNotFoundError as e:
+        print(f"Error: Could not find labels.csv in '{data_path}'.")
+        raise e
+
+    # 3. Align subjects and create data lists
+    list_adj = []
+    list_labels = []
+    
+    # Get the intersection of subject keys to ensure we only use complete data
+    common_subjects = sorted(list(set(sc_data.keys()) & set(fc_data.keys()) & set(labels_df.index)))
+    
+    if not common_subjects:
+        raise ValueError("No common subjects found across SC, FC, and labels files.")
+        
+    print(f"Found {len(common_subjects)} common subjects.")
+
+    for subject_key in common_subjects:
+        sc_matrix = sc_data[subject_key]
+        fc_matrix = fc_data[subject_key]
+
+        # Convert matrices to sparse format (csr is efficient)
+        # Assuming they are numpy arrays from the pickle file
+        sc_sparse = sp.csr_matrix(sc_matrix)
+        fc_sparse = sp.csr_matrix(fc_matrix)
+
+        # Create the multi-view list for this subject
+        multi_view_adj = [sc_sparse, fc_sparse]
+        list_adj.append(multi_view_adj)
+        
+        # Get the multi-label vector
+        subject_labels = labels_df.loc[subject_key].values.astype(np.float32)
+        is_ill = 1.0 if np.sum(subject_labels) > 0 else 0.0
+        list_labels.append(is_ill)
+
+    # Node features are not present in this dataset
+    list_x = [None] * len(list_adj)
+    
+    return list_adj, list_x, list_labels
 
 
 

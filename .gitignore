@@ -1,5 +1,3 @@
-MMD_*
-generated_graph_train/
-!ReportedResult/*
-!mmd_rnn.py
-data/geometric/
+*
+remote add origin git@github.com:ConnorSaveWorld/GraphVAE.git*/*.py
+!.gitignore

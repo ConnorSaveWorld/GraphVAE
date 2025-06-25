@@ -403,4 +403,3 @@ class Learnable_Histogram(torch.nn.Module):
     def reset_parameters(self):
         self.bin_width = torch.nn.init.xavier_uniform_(self.bin_width)
         self.bin_center = torch.nn.init.xavier_uniform_(self.bin_center)
-
