@@ -12,8 +12,8 @@ def emd(x, y, distance_scaling=1.0):
     distance_mat = d_mat / distance_scaling
 
     # convert histogram values x and y to float, and make them equal len
-    x = x.astype(np.float)
-    y = y.astype(np.float)
+    x = x.astype(float)
+    y = y.astype(float)
     if len(x) < len(y):
         x = np.hstack((x, [0.0] * (support_size - len(x))))
     elif len(y) < len(x):
@@ -31,8 +31,8 @@ def l2(x, y):
 def gaussian_tv(x, y, sigma=1.0):
   support_size = max(len(x), len(y))
   # convert histogram values x and y to float, and make them equal len
-  x = x.astype(np.float)
-  y = y.astype(np.float)
+  x = x.astype(float)
+  y = y.astype(float)
   if len(x) < len(y):
     x = np.hstack((x, [0.0] * (support_size - len(x))))
   elif len(y) < len(x):
@@ -52,8 +52,8 @@ def gaussian_emd(x, y, sigma=1.0, distance_scaling=1.0):
     distance_mat = d_mat / distance_scaling
 
     # convert histogram values x and y to float, and make them equal len
-    x = x.astype(np.float)
-    y = y.astype(np.float)
+    x = x.astype(float)
+    y = y.astype(float)
     if len(x) < len(y):
         x = np.hstack((x, [0.0] * (support_size - len(x))))
     elif len(y) < len(x):

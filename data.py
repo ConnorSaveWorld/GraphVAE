@@ -253,7 +253,7 @@ class Datasets():
   def get_adj_list(self):
       return self.adj_s
 
-  def get__(self,from_, to_, self_for_none, bfs=None, ignore_isolate_nodes = False):
+  def get__(self,from_, to_, self_for_none, bfs=None, ignore_isolate_nodes = False, get_labels=False):
     adj_s_batch = self.adj_s[from_:to_]
     x_s_batch = self.x_s[from_:to_]
     num_nodes_batch = self.num_nodes[from_:to_]
@@ -267,7 +267,19 @@ class Datasets():
             # Assuming element is a list/array of features for all graphs
             graphfeatures_batch.append(element[from_:to_])
     
-    return adj_s_batch, x_s_batch, num_nodes_batch, subgraph_indexes_batch, graphfeatures_batch
+    if get_labels:
+        if self.labels is not None:
+            labels_batch = self.labels[from_:to_]
+            # The original return statement had 5 items. We now add labels as the 6th.
+            return adj_s_batch, x_s_batch, num_nodes_batch, subgraph_indexes_batch, graphfeatures_batch, labels_batch
+        else:
+            # Handle the case where labels were not provided to the dataset
+            # We'll return None for the labels.
+            return adj_s_batch, x_s_batch, num_nodes_batch, subgraph_indexes_batch, graphfeatures_batch, None
+    else:
+        # If get_labels is False, maintain the original behavior
+        return adj_s_batch, x_s_batch, num_nodes_batch, subgraph_indexes_batch, graphfeatures_batch
+
 
 
   def get_max_degree(self):
@@ -481,7 +493,7 @@ def list_graph_loader( graph_type, _max_list_size=None, return_labels=False, lim
   list_labels = []
 
   if graph_type == "Multi":
-    list_adj, list_x, list_labels = load_neuroimaging_data("/home/jinghu/diffusion/testDiff/GraphVAE-MM/dataset/Multi")
+    list_adj, list_x, list_labels = load_neuroimaging_data("/root/GraphVAE-MM/dataset/Multi")
 
   elif graph_type=="IMDBBINARY":
       data = dgl.data.GINDataset(name='IMDBBINARY', self_loop=False)

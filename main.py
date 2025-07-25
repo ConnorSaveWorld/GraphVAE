@@ -20,6 +20,9 @@ from sklearn.metrics import roc_auc_score as roc_auc_score_sklearn
 from torchmetrics.classification import Accuracy, F1Score, AUROC
 import torch._dynamo
 import torch.amp
+from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import GradScaler
+import torch.cuda.amp as amp
 
 np.random.seed(0)
 random.seed(0)
@@ -36,14 +39,14 @@ keepThebest = False
 
 parser = argparse.ArgumentParser(description='Kernel VGAE')
 
-parser.add_argument('-e', dest="epoch_number", default=10000, help="Number of Epochs to train the model", type=int)
+parser.add_argument('-e', dest="epoch_number", default=10, help="Number of Epochs to train the model", type=int)
 parser.add_argument('-v', dest="Vis_step", default=1000, help="at every Vis_step 'minibatch' the plots will be updated")
 parser.add_argument('-redraw', dest="redraw", default=False, help="either update the log plot each step")
 parser.add_argument('-lr', dest="lr", default=0.0003, help="model learning rate")
 parser.add_argument('-dataset', dest="dataset", default="Multi",
                     help="possible choices are:   wheel_graph,PTC, FIRSTMM_DB, star, triangular_grid, multi_community, NCI1, ogbg-molbbbp, IMDbMulti, grid, community, citeseer, lobster, DD")  # citeceer: ego; DD:protein
 parser.add_argument('-graphEmDim', dest="graphEmDim", default=1024, help="the dimention of graph Embeding LAyer; z")
-parser.add_argument('-graph_save_path', dest="graph_save_path", default=None,
+parser.add_argument('-graph_save_path', dest="graph_save_path", default="/root/GraphVAE-MM/generated_graph_train",
                     help="the direc to save generated synthatic graphs")
 parser.add_argument('-f', dest="use_feature", default=True, help="either use features or identity matrix")
 parser.add_argument('-PATH', dest="PATH", default="model",
@@ -56,7 +59,7 @@ parser.add_argument('-batchSize', dest="batchSize", default=200,
 parser.add_argument('-UseGPU', dest="UseGPU", default=True, help="either use GPU or not if availabel")
 parser.add_argument('-model', dest="model", default="GraphVAE-MM",
                     help="KernelAugmentedWithTotalNumberOfTriangles and kipf is the only option in this rep; NOTE KernelAugmentedWithTotalNumberOfTriangles=GraphVAE-MM and kipf=GraphVAE")
-parser.add_argument('-device', dest="device", default="cuda:2", help="Which device should be used")
+parser.add_argument('-device', dest="device", default="cuda:0", help="Which device should be used")
 #parser.add_argument('-task', dest="task", default="graphGeneration", help="only option in this rep is graphGeneration")
 parser.add_argument('-BFS', dest="bfsOrdering", default=False, help="use bfs for graph permutations", type=bool) ### MODIFICATION 1: Changed default to False
 parser.add_argument('-directed', dest="directed", default=True, help="is the dataset directed?!", type=bool)
@@ -635,6 +638,9 @@ model.to(device)
 
 optimizer = torch.optim.Adam(model.parameters(), lr, weight_decay=1e-5)
 
+# AMP scaler for Stage-1 training
+scaler_stage1 = GradScaler()
+
 # scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[5000,6000,7000,8000,9000], gamma=0.5)
 
 # pos_wight = torch.true_divide((list_graphs.max_num_nodes**2*len(list_graphs.processed_adjs)-list_graphs.toatl_num_of_edges),
@@ -777,42 +783,45 @@ for epoch in range(epoch_number):
         if kl_beta < kl_anneal_target:
             kl_beta = min(kl_anneal_target, kl_beta + kl_anneal_rate)
 
-        reconstructed_adj_views, prior_samples, post_mean, post_log_std, generated_kernel_val, reconstructed_adj_logit = model(
-            dgl_graphs_per_view, # Pass the list of DGL graphs
-            features_for_dgl,
-            batchSize,
-            subgraphs_indexes = None
-        )
-        
-        #Call the correct OptimizerVAE with multi-view arguments
-        kl_loss, reconstruction_loss, acc, total_loss, each_kernel_loss, log_sigma_values = OptimizerVAE(
-            reconstructed_adj_logit,           # Logits for all views
-            generated_kernel_val,              # Kernel stats for all views
-            subgraphs_target_tensor,           # Target adjacency tensors for all views
-            target_kelrnel_val,                # Target kernel stats for all views
-            post_log_std,
-            post_mean,
-            alpha,
-            pos_wight,
-            norm=2, # Your original norm value
-            beta=kl_beta
-        )
-        
-        loss = total_loss#new
+        # ---------------- AMP Forward & Loss ----------------
+        with amp.autocast(dtype=torch.float16):
+            reconstructed_adj_views, prior_samples, post_mean, post_log_std, generated_kernel_val, reconstructed_adj_logit = model(
+                dgl_graphs_per_view, # Pass the list of DGL graphs
+                features_for_dgl,
+                batchSize,
+                subgraphs_indexes = None
+            )
+
+            kl_loss, reconstruction_loss, acc, total_loss, each_kernel_loss, log_sigma_values = OptimizerVAE(
+                reconstructed_adj_logit,           # Logits for all views
+                generated_kernel_val,              # Kernel stats for all views
+                subgraphs_target_tensor,           # Target adjacency tensors for all views
+                target_kelrnel_val,                # Target kernel stats for all views
+                post_log_std,
+                post_mean,
+                alpha,
+                pos_wight,
+                norm=2, # Your original norm value
+                beta=kl_beta
+            )
+
+        loss = total_loss.float()
 
         tmp = [None for x in range(len(functions))]
         pltr.add_values(step, [acc.cpu().item(), loss.cpu().item(), *each_kernel_loss], tmp,
                         redraw=redraw)  # ["Accuracy", "loss", "AUC"])
 
         step += 1
-        optimizer.zero_grad()
-        loss.backward()
+        optimizer.zero_grad(set_to_none=True)
+        scaler_stage1.scale(loss).backward()
+        scaler_stage1.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) 
         if keepThebest and min_loss > loss:
             min_loss = loss.item()
             torch.save(model.state_dict(), "model")
         # torch.nn.utils.clip_grad_norm(model.parameters(),  1.0044e-05)
-        optimizer.step()
+        scaler_stage1.step(optimizer)
+        scaler_stage1.update()
 
         if (step + 1) % visulizer_step == 0 or epoch_number==epoch+1:
             model.eval()
@@ -825,13 +834,14 @@ for epoch in range(epoch_number):
                 rnd_indx = random.randint(0, len(node_num) - 1)
                 
                 # Get the first view [:, 0, :, :] for all graphs in the batch
+                # Keep everything on GPU until the last moment
                 reconstructed_first_view = torch.sigmoid(reconstructed_adj_logit)[:, 0, :, :]
 
-                # Now select a random sample from that view
-                sample_graph = reconstructed_first_view[rnd_indx].cpu().detach().numpy()
-                sample_graph = sample_graph[:node_num[rnd_indx], :node_num[rnd_indx]]
-                sample_graph[sample_graph >= 0.5] = 1
-                sample_graph[sample_graph < 0.5] = 0
+                # Process random sample on GPU, only move to CPU when needed for NetworkX
+                sample_graph_gpu = reconstructed_first_view[rnd_indx]
+                sample_graph_gpu = sample_graph_gpu[:node_num[rnd_indx], :node_num[rnd_indx]]
+                sample_graph_binary = (sample_graph_gpu >= 0.5).float()
+                sample_graph = sample_graph_binary.cpu().detach().numpy()
 
                 G = nx.from_numpy_array(sample_graph)
                 plotter.plotG(G, "generated_" + dataset + "_view0",
@@ -840,21 +850,31 @@ for epoch in range(epoch_number):
                 print("reconstructed graph vs Validation:")
                 logging.info("reconstructed graph vs Validation:")
 
-                # The rest of this evaluation logic also needs to be updated
-                reconstructed_adj_for_eval = reconstructed_first_view.cpu().detach().numpy()
-                reconstructed_adj_for_eval[reconstructed_adj_for_eval >= 0.5] = 1
-                reconstructed_adj_for_eval[reconstructed_adj_for_eval < 0.5] = 0
+                # Do thresholding on GPU before moving to CPU
+                reconstructed_adj_binary = (reconstructed_first_view >= 0.5).float()
+                reconstructed_adj_for_eval = reconstructed_adj_binary.cpu().detach().numpy()
                 
+                # Move NetworkX operations to CPU (as required)
                 reconstructed_graphs = [nx.from_numpy_array(reconstructed_adj_for_eval[i]) for i in range(reconstructed_adj_for_eval.shape[0])]
                 reconstructed_graphs = [nx.Graph(G.subgraph(max(nx.connected_components(G), key=len))) for G in
                                      reconstructed_graphs if not nx.is_empty(G)]
 
-                # The target set also needs to be multi-view aware
-                target_set = [nx.from_numpy_array(val_adj[i][0].toarray()) for i in range(len(val_adj))] # Using first view of validation set
+                # Process validation set - move to GPU first if possible
+                target_set = []
+                for i in range(len(val_adj)):
+                    # Convert sparse array to numpy and create NetworkX graph
+                    graph_array = val_adj[i][0].toarray()
+                    nx_graph = nx.from_numpy_array(graph_array)
+                    target_set.append(nx_graph)
+                
                 target_set = [nx.Graph(G.subgraph(max(nx.connected_components(G), key=len))) for G in target_set if
                             not nx.is_empty(G)]
 
-                reconstruc_MMD_loss = mmd_eval(reconstructed_graphs, target_set[:len(reconstructed_graphs)], diam=True)
+                # Use only as many target graphs as we have reconstructed graphs
+                target_subset = target_set[:len(reconstructed_graphs)]
+                
+                # Run MMD evaluation (note: mmd_eval itself may need internal GPU optimizations)
+                reconstruc_MMD_loss = mmd_eval(reconstructed_graphs, target_subset, diam=True)
                 logging.info(reconstruc_MMD_loss)
 
             #todo: instead of printing diffrent level of logging shoud be used
@@ -957,18 +977,40 @@ if args.task == "graphClassification":
             train_dgl_views.append(dgl.batch(dgl_graphs).to(device))
         train_features = torch.stack(list_graphs.x_s).reshape(-1, list_graphs.feature_size).to(device)
         train_batch_size = [len(list_graphs.adj_s), list_graphs.max_num_nodes]
-        train_mean_nodes, _ = model.encode(train_dgl_views, train_features, train_batch_size)
+        train_node_embeddings, train_mean, train_log_std = model.encode(train_dgl_views, train_features, train_batch_size)
         train_graph_vectors = []
         for v_graph in train_dgl_views:
-            v_graph.ndata['z_mean'] = train_mean_nodes
+            v_graph.ndata['z_mean'] = train_node_embeddings
             train_graph_vectors.append(dgl.mean_nodes(v_graph, 'z_mean'))
             del v_graph.ndata['z_mean']
         train_embeddings = torch.cat(train_graph_vectors, dim=1)
         
-        # ### CHANGED ### - OPTIMIZATION 1: Prepare a list of individual graphs ONCE
-        # Instead of a single batched graph, we create a list of graphs. This avoids
-        # the costly unbatching inside the training loop.
-        train_dgl_graph_list = dgl.unbatch(train_dgl_views[0])
+        # --- CHANGED ---
+        # Prepare a list of individual graphs ONCE and keep them on the GPU.  This
+        # eliminates per-iteration host→device copies and Python-side batching.
+        train_dgl_graph_list = [g.to(device) for g in dgl.unbatch(train_dgl_views[0])]
+
+        # ---------------- DataLoader utilities -----------------
+        class DiffusionDataset(Dataset):
+            """Simple Dataset wrapping (graph, embedding, label)."""
+            def __init__(self, graphs, embeddings, labels):
+                self.graphs = graphs
+                self.embeddings = embeddings
+                self.labels = labels
+
+            def __len__(self):
+                return len(self.graphs)
+
+            def __getitem__(self, idx):
+                return self.graphs[idx], self.embeddings[idx], self.labels[idx]
+
+        def diffusion_collate(batch):
+            """Collate fn that batches DGLGraphs already on GPU and tensors."""
+            graphs, embeds, labels = map(list, zip(*batch))
+            batched_graph = dgl.batch(graphs)                         # already on GPU
+            embeds = torch.stack(embeds).to(device, non_blocking=True)
+            labels = torch.stack(labels).to(device, non_blocking=True)
+            return batched_graph, embeds, labels
 
         # --- Get Test Data ---
         test_dgl_views = []
@@ -978,10 +1020,10 @@ if args.task == "graphClassification":
             test_dgl_views.append(dgl.batch(dgl_graphs).to(device))
         test_features = torch.stack(list_test_graphs.x_s).reshape(-1, list_test_graphs.feature_size).to(device)
         test_batch_size = [len(list_test_graphs.adj_s), list_test_graphs.max_num_nodes]
-        test_mean_nodes, _ = model.encode(test_dgl_views, test_features, test_batch_size)
+        test_node_embeddings, test_mean, test_log_std = model.encode(test_dgl_views, test_features, test_batch_size)
         test_graph_vectors = []
         for v_graph in test_dgl_views:
-            v_graph.ndata['z_mean'] = test_mean_nodes
+            v_graph.ndata['z_mean'] = test_node_embeddings
             test_graph_vectors.append(dgl.mean_nodes(v_graph, 'z_mean'))
             del v_graph.ndata['z_mean']
         test_embeddings = torch.cat(test_graph_vectors, dim=1)
@@ -990,15 +1032,40 @@ if args.task == "graphClassification":
     print(f"Generated {train_embeddings.shape[0]} training embeddings (dim={train_embeddings.shape[1]}) and {test_embeddings.shape[0]} test embeddings.")
     logging.info(f"Generated {train_embeddings.shape[0]} training embeddings (dim={train_embeddings.shape[1]}) and {test_embeddings.shape[0]} test embeddings.")
     
-    # --- SANITY CHECKS with Simple Classifiers ---
+    # --- t-SNE Visualization of Embeddings ---
+    from sklearn.manifold import TSNE
+    import matplotlib.pyplot as plt
+    import os
+    
+    def plot_tsne(embeddings, labels, title, filename):
+        try:
+            # For newer scikit-learn versions
+            tsne = TSNE(n_components=2, random_state=42, perplexity=30, n_iter=1000)
+        except TypeError:
+            # For older scikit-learn versions
+            tsne = TSNE(n_components=2, random_state=42, perplexity=30)
+        emb_2d = tsne.fit_transform(embeddings)
+        plt.figure(figsize=(8, 6))
+        scatter = plt.scatter(emb_2d[:, 0], emb_2d[:, 1], c=labels, cmap='tab10', alpha=0.7)
+        plt.title(title)
+        plt.xlabel('t-SNE 1')
+        plt.ylabel('t-SNE 2')
+        plt.colorbar(scatter, label='Label')
+        plt.tight_layout()
+        plt.savefig(filename)
+        plt.close()
+        print(f"Saved t-SNE plot to {filename}")
+
     X_train = train_embeddings.cpu().numpy()
     y_train = train_labels.cpu().numpy().ravel()
     X_test = test_embeddings.cpu().numpy()
     y_test = test_labels.cpu().numpy().ravel()
 
-    print("\n--- Running Sanity Checks on VAE Embeddings ---")
-    logging.info("\n--- Running Sanity Checks on VAE Embeddings ---")
-    
+    # Plot t-SNE for train and test embeddings
+    plot_tsne(X_train, y_train, 't-SNE of Train Graph Embeddings', 'tsne_train.png')
+    plot_tsne(X_test, y_test, 't-SNE of Test Graph Embeddings', 'tsne_test.png')
+    # --- SANITY CHECKS with Simple Classifiers ---
+
     # Logistic Regression
     log_reg = LogisticRegression(max_iter=1000, class_weight='balanced', random_state=42)
     log_reg.fit(X_train, y_train)
@@ -1087,24 +1154,25 @@ if args.task == "graphClassification":
     logging.info("\n--- Training the Diffusion Classifier ---")
     num_diffusion_epochs = 800
     batch_size = 32
-    eval_every_epochs = 1 
+    eval_every_epochs = 1
 
-    train_indices = list(range(len(list_graphs.adj_s)))
+    # DataLoader that handles shuffling & batching in background worker processes
+    train_dataset = DiffusionDataset(train_dgl_graph_list, train_embeddings, train_labels)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,          # workers>0 cannot handle GPU tensors safely
+        pin_memory=True,
+        collate_fn=diffusion_collate
+    )
 
     for epoch in range(num_diffusion_epochs):
-        diffusion_classifier.train() 
-        random.shuffle(train_indices)
+        diffusion_classifier.train()
         epoch_loss = 0.0
         num_batches = 0
-        for i in range(0, len(train_indices), batch_size):
-            batch_indices = train_indices[i:i+batch_size]
-            if not batch_indices: continue
-            
-            graphs_for_batch = [train_dgl_graph_list[j] for j in batch_indices]
-            batch_dgl_graph = dgl.batch(graphs_for_batch).to(device)
 
-            batch_embeddings = train_embeddings[batch_indices]
-            batch_labels = train_labels[batch_indices]
+        for batch_dgl_graph, batch_embeddings, batch_labels in train_loader:
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type="cuda", dtype=torch.float16):

@@ -28,7 +28,7 @@ class DynamicCouplingLayer(nn.Module):
         # MLP to generate coupling representation C_i from [H_view1 || H_view2]
         self.mlp_couple = Sequential(
             Linear(hidden_dim * 2, dim_coupling),
-            ReLU(True),
+            nn.GELU(),
             Dropout(dropout_rate)
         )
 
@@ -39,7 +39,7 @@ class DynamicCouplingLayer(nn.Module):
         # MLP for fusing the gated representations
         self.fusion_mlp = Sequential(
             Linear(hidden_dim * 2, hidden_dim),  # Input is [gated_H_v1 || gated_H_v2]
-            ReLU(True),
+            nn.GELU(),
             Dropout(dropout_rate)
         )
 
@@ -49,7 +49,7 @@ class DynamicCouplingLayer(nn.Module):
 
         self.norm_v1 = LayerNorm(hidden_dim)
         self.norm_v2 = LayerNorm(hidden_dim)
-        self.act = ReLU(True)
+        self.act = nn.GELU()
         self.dropout = Dropout(dropout_rate)
 
     def forward(self, h_v1, h_v2):
@@ -78,6 +78,108 @@ class DynamicCouplingLayer(nn.Module):
 
         return h_v1_new, h_v2_new
 
+
+class ChannelAttentionGraph(nn.Module):
+    """CBAM-inspired channel attention for graph node features"""
+    def __init__(self, hidden_dim, reduction=8):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.max_pool = nn.AdaptiveMaxPool1d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // reduction, bias=False),
+            nn.ReLU(True),
+            nn.Linear(hidden_dim // reduction, hidden_dim, bias=False),
+        )
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, x):
+        # x: (N, D) where N is number of nodes
+        b, c = x.size()
+        
+        # Global average and max pooling across all nodes
+        avg_out = self.fc(x.mean(dim=0, keepdim=True))  # (1, D)
+        max_out = self.fc(x.max(dim=0, keepdim=True)[0])  # (1, D)
+        
+        # Channel attention weights
+        attention = self.sigmoid(avg_out + max_out)  # (1, D)
+        
+        return x * attention.expand_as(x)
+
+
+# >>> ADD START: GraphSpatialAttention and GraphCBAM for graph data <<<
+class GraphSpatialAttention(nn.Module):
+    """Spatial attention over graph nodes (treats nodes as the spatial dimension)."""
+    def __init__(self, hidden_dim: int, kernel_size: int = 3):
+        super().__init__()
+        # Use 1D convolution where the sequence length is the number of nodes
+        self.conv = nn.Conv1d(in_channels=2, out_channels=1,
+                              kernel_size=kernel_size,
+                              padding=(kernel_size - 1) // 2,
+                              bias=False)
+        self.sigmoid = nn.Sigmoid()
+        self.ln = nn.LayerNorm(hidden_dim)  # stabilise stats
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (N_nodes_in_batch, D)
+        x_norm = self.ln(x)  # normalize before spatial attention
+        avg_out = x_norm.mean(dim=1, keepdim=True)  # (N,1)
+        max_out, _ = x_norm.max(dim=1, keepdim=True)  # (N,1)
+        y = torch.cat([avg_out, max_out], dim=1)  # (N,2)
+        # Conv1d expects (B, C, L). Treat batch=1, C=2, L=N
+        y = y.t().unsqueeze(0)  # (1,2,N)
+        y = self.sigmoid(self.conv(y))  # (1,1,N)
+        y = y.squeeze(0).t()  # (N,1)
+        return x * y.expand_as(x)
+
+
+class GraphCBAM(nn.Module):
+    """Convolutional Block Attention Module adapted for graph node features with residual gating."""
+    def __init__(self, hidden_dim: int, reduction: int = 8, spatial_kernel: int = 3):
+        super().__init__()
+        self.channel_att = ChannelAttentionGraph(hidden_dim, reduction)
+        self.spatial_att = GraphSpatialAttention(hidden_dim, kernel_size=spatial_kernel)
+        self.gamma = nn.Parameter(torch.zeros(1))  # learnable gate initialized to 0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Apply channel attention first (as before)
+        x = self.channel_att(x)
+        # Add spatial attention as a residual refinement with learnable gating
+        return x + self.gamma * self.spatial_att(x)
+# >>> ADD END <<<
+
+
+class GraphNonLocalBlock(nn.Module):
+    """Non-local block adapted for graph node features"""
+    def __init__(self, hidden_dim, reduction=2):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.inter_dim = hidden_dim // reduction
+        
+        self.theta = nn.Linear(hidden_dim, self.inter_dim, bias=False)
+        self.phi = nn.Linear(hidden_dim, self.inter_dim, bias=False)
+        self.g = nn.Linear(hidden_dim, self.inter_dim, bias=False)
+        self.out_proj = nn.Linear(self.inter_dim, hidden_dim, bias=False)
+        self.softmax = nn.Softmax(dim=-1)
+        
+    def forward(self, x):
+        # x: (N, D) where N is number of nodes
+        batch_size, _ = x.size()
+        
+        # Generate query, key, value
+        q = self.theta(x)  # (N, D//2)
+        k = self.phi(x)    # (N, D//2)
+        v = self.g(x)      # (N, D//2)
+        
+        # Attention matrix
+        attention = torch.matmul(q, k.transpose(-2, -1))  # (N, N)
+        attention = self.softmax(attention / (self.inter_dim ** 0.5))
+        
+        # Apply attention
+        out = torch.matmul(attention, v)  # (N, D//2)
+        out = self.out_proj(out)  # (N, D)
+        
+        # Residual connection
+        return x + out
 
 
 # In model.py
@@ -116,6 +218,11 @@ class DynamicCouplingEncoder(nn.Module):
                 DynamicCouplingLayer(hidden_dim, dim_coupling, dropout_rate)
             )
 
+        # --- Enhanced Attention Mechanisms ---
+        # Use CBAM (channel + spatial) followed by non-local block
+        self.graph_cbam = GraphCBAM(hidden_dim * 2, reduction=8, spatial_kernel=3)
+        self.nonlocal_block = GraphNonLocalBlock(hidden_dim * 2, reduction=2)
+
         # --- Final Fusion and Projection for VAE (no change here) ---
         final_fusion_dim = hidden_dim * 2
         self.final_projection = Linear(final_fusion_dim, GraphLatentDim)
@@ -123,7 +230,14 @@ class DynamicCouplingEncoder(nn.Module):
         self.stochastic_mean_layer = node_mlp(GraphLatentDim, [GraphLatentDim])
         self.stochastic_log_std_layer = node_mlp(GraphLatentDim, [GraphLatentDim])
         
-        self.activation = nn.LeakyReLU(0.01)
+        # --- Multi-Strategy Graph Pooling ---
+        self.pooling_projection = nn.Sequential(
+            nn.Linear(hidden_dim * 3, GraphLatentDim),  # 3 pooling strategies combined
+            nn.GELU(),
+            nn.Dropout(0.1)
+        )
+
+        self.activation = nn.GELU()
 
     def forward(self, graph_list, features, batchSize):
         h = self.initial_embedding(features)
@@ -142,13 +256,43 @@ class DynamicCouplingEncoder(nn.Module):
         for layer in self.coupling_layers:
             h_v1, h_v2 = layer(h_v1, h_v2)
 
+        # Apply enhanced attention after coupling
+        h_combined = torch.cat((h_v1, h_v2), dim=-1)
+        h_combined = self.graph_cbam(h_combined)
+        h_combined = self.nonlocal_block(h_combined)
+        h_v1, h_v2 = h_combined[:, :self.hidden_dim], h_combined[:, self.hidden_dim:]
+
         h_final_fused = torch.cat((h_v1, h_v2), dim=-1)
         h_final = self.activation(self.final_projection(h_final_fused))
-        
-        mean = self.stochastic_mean_layer(h_final, activation=lambda x: x)
-        log_std = self.stochastic_log_std_layer(h_final, activation=lambda x: x)
 
-        return mean, log_std
+
+        #(NEW new New)
+        final_node_embeddings = self.activation(self.final_projection(h_final_fused))
+        # --- GRAPH-LEVEL POOLING (Learnable Attention) ---
+        batched_graph = graph_list[0]
+        
+        # Multi-strategy pooling: mean + max + sum for robustness
+        batched_graph.ndata['h_temp'] = final_node_embeddings
+        mean_pool = dgl.mean_nodes(batched_graph, 'h_temp')
+        max_pool = dgl.max_nodes(batched_graph, 'h_temp')
+        sum_pool = dgl.sum_nodes(batched_graph, 'h_temp')
+        del batched_graph.ndata['h_temp']
+        
+        # Combine pooling strategies
+        combined_pool = torch.cat([mean_pool, max_pool, sum_pool], dim=-1)
+        graph_level_embedding = self.pooling_projection(combined_pool)
+        
+        # --- Generate distribution from the GRAPH-LEVEL embedding ---
+        mean = self.stochastic_mean_layer(graph_level_embedding, activation=lambda x: x)
+        log_std = self.stochastic_log_std_layer(graph_level_embedding, activation=lambda x: x)
+        # The output of the forward pass for this encoder is now a tuple
+        # This will be used by StagedSupervisedVAE
+        return final_node_embeddings, mean, log_std
+        
+        # mean = self.stochastic_mean_layer(h_final, activation=lambda x: x)
+        # log_std = self.stochastic_log_std_layer(h_final, activation=lambda x: x)
+
+        # return mean, log_std
 
 
 class AveEncoder(torch.nn.Module):
@@ -268,18 +412,18 @@ class kernelGVAE(torch.nn.Module):
         The forward pass for a TRUE Node-Level VAE.
         """
         # 1. ENCODING
-        # mean and log_std have shape: (total_nodes_in_batch, graphEmDim)
-        mean, log_std = self.encode(graph_list, features, batchSize)
+        # The encoder returns node embeddings, and graph-level mean and log_std
+        node_embeddings, mean, log_std = self.encode(graph_list, features, batchSize)
         
         # 2. SAMPLING
-        # z_nodes has shape: (total_nodes_in_batch, graphEmDim)
-        z_nodes = self.reparameterize(mean, log_std)
+        # We still sample at the graph level for other purposes (like KL divergence)
+        # but we will use the direct node_embeddings for reconstruction.
+        z_graph = self.reparameterize(mean, log_std)
         
         # 3. DECODING
-        # The new decoder takes the batched graph structure and the node embeddings.
-        # We use the first view's graph structure, as it contains the batching info.
+        # The decoder takes the batched graph structure and the NODE embeddings.
         batched_graph = graph_list[0]
-        reconstructed_adj_logit_views = self.decode(batched_graph, z_nodes)
+        reconstructed_adj_logit_views = self.decode(batched_graph, node_embeddings)
         
         reconstructed_adj_views = torch.sigmoid(reconstructed_adj_logit_views)
 
@@ -371,7 +515,7 @@ class MultiViewAveEncoder(torch.nn.Module):
         mean = self.stochastic_mean_layer(h, activation=lambda x: x)
         log_std = self.stochastic_log_std_layer(h, activation=lambda x: x)
 
-        return mean, log_std
+        return h, mean, log_std
 
 # class AveEncoder(torch.nn.Module):
 #     def __init__(self, in_feature_dim, hiddenLayers=[256, 256, 256], GraphLatntDim=1024):
@@ -471,8 +615,8 @@ class MultiViewAveEncoder(torch.nn.Module):
 #         #     ADJ = in_tensor.reshape(in_tensor.shape[0], self.SubGraphNodeNum, -1)
 #         # else:
 #         #     ADJ = torch.zeros((in_tensor.shape[0], self.SubGraphNodeNum, self.SubGraphNodeNum)).to(in_tensor.device)
-#         #     ADJ[:, torch.tril_indices(self.SubGraphNodeNum, self.SubGraphNodeNum, -1)[0],
-#         #     torch.tril_indices(self.SubGraphNodeNum, self.SubGraphNodeNum, -1)[1]] = in_tensor[:,
+#         #     ADJ[:, torch.tril_indices(self.SubGraphNodeNum, self.SubGraphNodeDim, -1)[0],
+#         #     torch.tril_indices(self.SubGraphNodeNum, self.SubGraphNodeDim, -1)[1]] = in_tensor[:,
 #         #                                                                    :(in_tensor.shape[-1]) - self.SubGraphNodeNum]
 #         #     ADJ = ADJ + ADJ.permute(0, 2, 1)
 #         #     ind = np.diag_indices(ADJ.shape[-1])
@@ -480,7 +624,7 @@ class MultiViewAveEncoder(torch.nn.Module):
 #         # # adj_list= torch.matmul(torch.matmul(in_tensor, self.lamda),in_tensor.permute(0,2,1))
 #         # # return adj_list
 #         # # if subgraphs_indexes==None:
-#         # # adj_list= torch.matmul(in_tensor,in_tensor.permute(0,2,1))
+#         # adj_list= torch.matmul(in_tensor,in_tensor.permute(0,2,1))
 #         # return ADJ
 #         # # else:
 #         # #     adj_list = []
@@ -686,3 +830,107 @@ class NodeLevelInnerProductDecoder(nn.Module):
         adj_logits_views = reconstructed_adj_logits.unsqueeze(1).repeat(1, self.num_views, 1, 1)
 
         return adj_logits_views
+
+class ClassificationDecoder(nn.Module):
+    """
+    Enhanced MLP decoder with residual connections, attention, and better regularization
+    inspired by SOTA VAE architectures.
+    """
+    def __init__(self, latent_dim, hidden_dim, num_classes, dropout_rate=0.3):
+        super().__init__()
+        
+        # Enhanced architecture with residual blocks
+        self.input_proj = nn.Linear(latent_dim, hidden_dim)
+        
+        # Residual blocks for better gradient flow
+        self.res_block1 = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),  # GELU activation for better gradients
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        
+        self.res_block2 = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        
+        # Channel attention for feature refinement
+        self.channel_attn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 8),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 8, hidden_dim),
+            nn.Sigmoid()
+        )
+        
+        # Layer normalization for stability
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        
+        # Final classification layers
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(p=dropout_rate),
+            nn.Linear(hidden_dim // 2, hidden_dim // 4),
+            nn.GELU(),
+            nn.Dropout(p=dropout_rate),
+            nn.Linear(hidden_dim // 4, num_classes)
+        )
+
+    def forward(self, z_graph):
+        # Apply input projection
+        h = self.input_proj(z_graph)
+        
+        # First residual block with layer norm
+        h = self.norm1(h)
+        residual = h
+        h = self.res_block1(h)
+        h = h + residual  # Residual connection
+        
+        # Second residual block with layer norm
+        h = self.norm2(h)
+        residual = h
+        h = self.res_block2(h)
+        h = h + residual  # Residual connection
+        
+        # Apply channel attention
+        attention = self.channel_attn(h)
+        h = attention * h
+        
+        # Final classification
+        return self.mlp(h)
+
+class StagedSupervisedVAE(nn.Module):
+    """
+    A VAE designed for two-stage training.
+    In Stage 1 (training this model), it performs supervised graph classification.
+    Its `encode` method can then be used in Stage 2 as a feature extractor
+    for either node or graph embeddings.
+    """
+    def __init__(self, encoder, decoder):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+
+    def reparameterize(self, mean, log_std):
+        std = torch.exp(0.5 * log_std)
+        eps = torch.randn_like(std)
+        return eps.mul(std).add_(mean)
+
+    def forward(self, graph_list, features, batchSize):
+        """
+        This forward pass is for training Stage 1.
+        """
+        # The encoder should be modified to return both node and graph embeddings
+        node_embeddings, graph_mean, graph_log_std = self.encoder(graph_list, features, batchSize)
+
+        # Sample from the graph-level distribution
+        z_graph = self.reparameterize(graph_mean, graph_log_std)
+
+        # Decode to get class predictions
+        predicted_logits = self.decoder(z_graph)
+
+        return predicted_logits, graph_mean, graph_log_std, node_embeddings
