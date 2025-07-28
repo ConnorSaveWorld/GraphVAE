@@ -1,3 +1,8 @@
+# Ignore all files by default
 *
-remote add origin git@github.com:ConnorSaveWorld/GraphVAE.git*/*.py
+
+# Do not ignore this file
 !.gitignore
+
+# Track every Python file, regardless of directory depth
+!**/*.py
