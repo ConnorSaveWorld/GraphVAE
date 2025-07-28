@@ -494,6 +494,9 @@ def list_graph_loader( graph_type, _max_list_size=None, return_labels=False, lim
 
   if graph_type == "Multi":
     list_adj, list_x, list_labels = load_neuroimaging_data("/root/GraphVAE-MM/dataset/Multi")
+  elif graph_type =="PPMI":
+    list_adj, list_x, list_labels = load_PPMI("/root/GraphVAE-MM/dataset/PPMI")
+
 
   elif graph_type=="IMDBBINARY":
       data = dgl.data.GINDataset(name='IMDBBINARY', self_loop=False)
@@ -1083,6 +1086,148 @@ def load_neuroimaging_data(data_path):#new
     list_x = [None] * len(list_adj)
     
     return list_adj, list_x, list_labels
+
+def load_PPMI(data_path):
+    """
+    Load PPMI dataset with SC and FC matrices and labels.
+    
+    Args:
+        data_path (str): Path to the dataset directory
+        
+    Returns:
+        tuple: (list_adj, list_x, list_labels) where list_adj contains multi-view graphs
+    """
+    import scipy.io as sio
+    from sklearn.preprocessing import normalize
+    from tqdm import tqdm
+    
+    # Define file paths - assuming standard naming convention
+    sc_path = os.path.join(data_path, "scnHCPD.mat")
+    fc_path = os.path.join(data_path, "fcnHCPD.mat")
+    label_path = os.path.join(data_path, "labHCPD.mat")
+    
+    # Define default mat keys - these may need to be adjusted based on actual file structure
+    sc_mat_key = "scn_corr"
+    fc_mat_key = "fcn_corr"
+    label_mat_key = "labels"
+
+    # --- Load Raw Data ---
+    try:
+        sc_data = sio.loadmat(sc_path)
+        fc_data = sio.loadmat(fc_path)
+        label_data = sio.loadmat(label_path)
+        
+        if label_mat_key not in label_data: 
+            raise KeyError(f"Key '{label_mat_key}' not found in label file: {label_path}")
+        all_labels = label_data[label_mat_key].flatten()
+        
+        if fc_mat_key not in fc_data: 
+            raise KeyError(f"Key '{fc_mat_key}' not found in FC file: {fc_path}")
+        all_fc_matrices_obj = fc_data[fc_mat_key]
+        
+        if sc_mat_key not in sc_data: 
+            raise KeyError(f"Key '{sc_mat_key}' not found in SC file: {sc_path}")
+        all_sc_matrices_obj = sc_data[sc_mat_key]
+        
+        print("Raw .mat files loaded successfully.")
+    except Exception as e:
+        print(f"FATAL ERROR during file loading: {e}")
+        raise e
+
+    # --- Validate Data ---
+    # Handle potential differences in how data is stored (direct array vs object array)
+    if isinstance(all_sc_matrices_obj, np.ndarray) and all_sc_matrices_obj.dtype == 'object':
+        num_subjects_sc = all_sc_matrices_obj.shape[0]
+        is_sc_obj_array = True
+    elif isinstance(all_sc_matrices_obj, np.ndarray) and all_sc_matrices_obj.ndim == 3:
+        num_subjects_sc = all_sc_matrices_obj.shape[0]
+        is_sc_obj_array = False
+    else:
+        raise TypeError(f"Unexpected SC data format: {type(all_sc_matrices_obj)}, shape: {getattr(all_sc_matrices_obj, 'shape', 'N/A')}")
+
+    if isinstance(all_fc_matrices_obj, np.ndarray) and all_fc_matrices_obj.dtype == 'object':
+        num_subjects_fc = all_fc_matrices_obj.shape[0]
+        is_fc_obj_array = True
+    elif isinstance(all_fc_matrices_obj, np.ndarray) and all_fc_matrices_obj.ndim == 3:
+        num_subjects_fc = all_fc_matrices_obj.shape[0]
+        is_fc_obj_array = False
+    else:
+        raise TypeError(f"Unexpected FC data format: {type(all_fc_matrices_obj)}, shape: {getattr(all_fc_matrices_obj, 'shape', 'N/A')}")
+    
+    num_labels = all_labels.shape[0]
+    if not (num_labels == num_subjects_fc == num_subjects_sc):
+        msg = f"FATAL ERROR: Mismatch in subject counts! Labels:{num_labels}, FC:{num_subjects_fc}, SC:{num_subjects_sc}"
+        print(msg)
+        raise ValueError(msg)
+    
+    n_subjects = num_labels
+    print(f"Found data for {n_subjects} subjects.")
+
+    # --- Create Multi-view Data Lists ---
+    list_adj = []
+    list_x = []
+    list_labels = []
+    skipped_subjects = 0
+    
+    for i in tqdm(range(n_subjects), desc="Reading Subjects & Creating Multi-view Data"):
+        try:
+            label = int(all_labels[i])
+            
+            # Get SC data
+            current_sc_data = all_sc_matrices_obj[i][0] if is_sc_obj_array else all_sc_matrices_obj[i]
+            if not isinstance(current_sc_data, np.ndarray) or current_sc_data.size == 0:
+                print(f"Warning: Subject {i}, skip SC")
+                skipped_subjects += 1
+                continue
+            subj_sc_adj = current_sc_data
+            
+            # Get FC data
+            current_fc_data = all_fc_matrices_obj[i][0] if is_fc_obj_array else all_fc_matrices_obj[i]
+            if not isinstance(current_fc_data, np.ndarray) or current_fc_data.size == 0:
+                print(f"Warning: Subject {i}, skip FC")
+                skipped_subjects += 1
+                continue
+            subj_fc_adj = current_fc_data
+            
+            # Validate matrix shapes
+            if (subj_sc_adj.ndim != 2 or subj_fc_adj.ndim != 2 or 
+                subj_sc_adj.shape[0] != subj_sc_adj.shape[1] or 
+                subj_fc_adj.shape[0] != subj_fc_adj.shape[1] or 
+                subj_sc_adj.shape != subj_fc_adj.shape):
+                print(f"Warning: Subject {i} matrix shape mismatch. Skip.")
+                skipped_subjects += 1
+                continue
+                
+            if subj_sc_adj.shape[0] == 0:
+                print(f"Warning: Subject {i}, zero nodes. Skip.")
+                skipped_subjects += 1
+                continue
+            
+            # Normalize matrices
+            norm_type = 'l1'
+            subj_sc_normalized = normalize(subj_sc_adj, norm=norm_type, axis=1)
+            subj_fc_normalized = normalize(subj_fc_adj, norm=norm_type, axis=1)
+            
+            # Convert to sparse matrices
+            sc_sparse = sp.csr_matrix(subj_sc_normalized)
+            fc_sparse = sp.csr_matrix(subj_fc_normalized)
+            
+            # Create multi-view adjacency list
+            multi_view_adj = [sc_sparse, fc_sparse]
+            list_adj.append(multi_view_adj)
+            list_x.append(None)  # No node features
+            list_labels.append(label)
+            
+        except Exception as e:
+            print(f"Error: Subject {i} processing failed: {e}. Skip.")
+            skipped_subjects += 1
+            continue
+    
+    print(f"Created multi-view data for {len(list_adj)} subjects (skipped {skipped_subjects}).")
+    if not list_adj:
+        raise ValueError("No valid subject data found.")
+    
+    return list_adj, list_x, list_labels 
 
 
 
