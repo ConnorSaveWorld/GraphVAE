@@ -18,6 +18,7 @@ import scipy.sparse as sp
 from tqdm import tqdm
 
 # --- Project-specific Imports from First Script ---
+from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, confusion_matrix
 from model import StagedSupervisedVAE, ClassificationDecoder, DynamicCouplingEncoder
 from data import list_graph_loader, Datasets
 
@@ -579,7 +580,6 @@ def collate_dgl(batch):
 
 def evaluate_with_svm(model, data_loader, T_values, device):
     """Memory-efficient evaluation with simpler pooling and classifiers."""
-    # Wrap everything in try/except to avoid crashes during evaluation
     try:
         model.eval()
         
@@ -587,155 +587,232 @@ def evaluate_with_svm(model, data_loader, T_values, device):
         avg_pooler = AvgPooling()
         max_pooler = MaxPooling()
     
-    # Get feature dimension from model - handle different model structures
+        # Get feature dimension from model
         if hasattr(model.net, 'out_dim'):
             feature_dim = model.net.out_dim
         elif hasattr(model.net, 'num_hidden'):
             feature_dim = model.net.num_hidden
         else:
-            # Default fallback
             feature_dim = 768
             
-        # print(f"Using feature dimension: {feature_dim}")
-        
         # Simpler attention pooling
         attn_gate_nn = nn.Sequential(
             nn.Linear(feature_dim, 64),
             nn.GELU(),
             nn.Linear(64, 1)
         ).to(device)
-    except Exception as e:
-        print(f"Error setting up attention pooling: {e}")
-        # Simple fallback
-        attn_gate_nn = nn.Sequential(
-            nn.Linear(768, 64),
-            nn.GELU(),
-            nn.Linear(64, 1)
-        ).to(device)
-    attn_pooler = GlobalAttentionPooling(attn_gate_nn)
-    
-    # Set up Set2Set pooler with appropriate dimensions
-    try:
-        if hasattr(model.net, 'out_dim'):
-            feature_dim = model.net.out_dim
-        elif hasattr(model.net, 'num_hidden'):
-            feature_dim = model.net.num_hidden
-        else:
-            feature_dim = 768
+        attn_pooler = GlobalAttentionPooling(attn_gate_nn)
         
-        set2set_pooler = Set2Set(feature_dim, n_iters=3, n_layers=1).to(device)
-    except Exception as e:
-        print(f"Error setting up Set2Set pooler: {e}")
-        # Create a dummy pooler that won't be used
-        set2set_pooler = None
+        # Set up Set2Set pooler
+        try:
+            set2set_pooler = Set2Set(feature_dim, n_iters=3, n_layers=1).to(device)
+        except Exception as e:
+            print(f"Error setting up Set2Set pooler: {e}")
+            set2set_pooler = None
     
-    # Storage for embeddings and labels
-    all_labels, embeds_by_T = [], {t: [] for t in T_values}
-    
-    # Process each batch
-    for batch_g, labels in tqdm(data_loader, desc="Extracting embeddings"):
-        batch_g, labels = batch_g.to(device), labels.to(device)
-        feat = batch_g.ndata['attr']
-        all_labels.append(labels.cpu())
+        # Storage for embeddings and labels
+        all_labels, embeds_by_T = [], {t: [] for t in T_values}
         
-        # Process a subset of timesteps to save memory
-        for t_val in T_values:
-            # Clear cache between iterations
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                
-            # Get denoised node features at this timestep
-            denoised_nodes = model.embed(batch_g, feat, t_val)
+        # Process each batch
+        for batch_g, labels in tqdm(data_loader, desc="Extracting embeddings"):
+            batch_g, labels = batch_g.to(device), labels.to(device)
+            feat = batch_g.ndata['attr']
+            all_labels.append(labels.cpu())
             
-            # Apply pooling strategies
-            avg_embed = avg_pooler(batch_g, denoised_nodes)
-            max_embed = max_pooler(batch_g, denoised_nodes)
-            attn_embed = attn_pooler(batch_g, denoised_nodes)
-            
-            # Use Set2Set pooler if available
-            if set2set_pooler is not None:
-                try:
-                    set2set_embed = set2set_pooler(batch_g, denoised_nodes)
-                    # Combine all embeddings
-                    combined_embed = torch.cat([avg_embed, max_embed, attn_embed, set2set_embed], dim=-1)
-                except Exception as e:
-                    print(f"Set2Set pooling failed: {e}")
-                    # Fall back to simpler pooling
-                    combined_embed = torch.cat([avg_embed, max_embed, attn_embed], dim=-1)
-            else:
-                # Simpler pooling without Set2Set
-                combined_embed = torch.cat([avg_embed, max_embed, attn_embed], dim=-1)
-            
-            # Store and immediately detach to free memory
-            embeds_by_T[t_val].append(combined_embed.cpu().detach())
-            
-            # Explicitly delete tensors to free memory
-            del denoised_nodes, avg_embed, max_embed, attn_embed, combined_embed
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-    
-    # Process all labels and embeddings
-    all_labels = torch.cat(all_labels, dim=0).numpy()
-    final_embeds = {t: torch.cat(embeds, dim=0).detach().numpy() for t, embeds in embeds_by_T.items()}
-    
-    # Free memory
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
-    # Perform cross-validation evaluation
-    kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    auc_list = []
-    
-    # For each fold in cross-validation
-    for fold_idx, (train_idx, test_idx) in enumerate(kf.split(final_embeds[T_values[0]], all_labels)):
-        # print(f"Evaluating fold {fold_idx+1}/5...")
-        test_scores = []
-        
-        # Use fewer timesteps for evaluation
-        eval_subset = T_values[::2] if len(T_values) > 6 else T_values  # Take every other value
-        
-        # Process each timestep
-        for t_val in eval_subset:
-            x_train, x_test = final_embeds[t_val][train_idx], final_embeds[t_val][test_idx]
-            y_train, y_test = all_labels[train_idx], all_labels[test_idx]
-            
-            # Simpler classifier set
-            classifiers = [
-                SVC(probability=True, C=1.0, kernel='rbf', random_state=42),
-                LogisticRegression(max_iter=1000, C=1.0, random_state=42)
-            ]
-            
-            # Train and get predictions
-            t_scores = []
-            for clf_idx, clf in enumerate(classifiers):
-                try:
-                    clf.fit(x_train, y_train)
-                    if hasattr(clf, 'decision_function'):
-                        scores = clf.decision_function(x_test)
-                    else:
-                        scores = clf.predict_proba(x_test)[:, 1]
-                    t_scores.append(scores)
-                except Exception as e:
-                    print(f"Warning: Classifier {clf_idx} failed: {e}")
+            # Process ALL timesteps (not a subset)
+            for t_val in T_values:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                     
-            if t_scores:
-                avg_score = np.mean(t_scores, axis=0)
-                test_scores.append(avg_score)
+                # Get denoised node features at this timestep
+                denoised_nodes = model.embed(batch_g, feat, t_val)
+                
+                # Apply pooling strategies
+                avg_embed = avg_pooler(batch_g, denoised_nodes)
+                max_embed = max_pooler(batch_g, denoised_nodes)
+                attn_embed = attn_pooler(batch_g, denoised_nodes)
+                
+                # Use Set2Set pooler if available
+                if set2set_pooler is not None:
+                    try:
+                        set2set_embed = set2set_pooler(batch_g, denoised_nodes)
+                        combined_embed = torch.cat([avg_embed, max_embed, attn_embed, set2set_embed], dim=-1)
+                    except Exception as e:
+                        combined_embed = torch.cat([avg_embed, max_embed, attn_embed], dim=-1)
+                else:
+                    combined_embed = torch.cat([avg_embed, max_embed, attn_embed], dim=-1)
+                
+                embeds_by_T[t_val].append(combined_embed.cpu().detach())
+                
+                del denoised_nodes, avg_embed, max_embed, attn_embed, combined_embed
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         
-        if test_scores:
-            final_scores = np.mean(test_scores, axis=0)
-            try:
-                auc = roc_auc_score(y_test, final_scores)
-                auc_list.append(auc)
-                # print(f"Fold {fold_idx+1} AUC: {auc:.4f}")
-            except Exception as e:
-                print(f"Error computing AUC: {e}")
-    
-    if auc_list:
-        return np.mean(auc_list), np.std(auc_list)
-    else:
-        print("WARNING: Evaluation failed completely!")
-        return 0.0, 0.0
+        # Process all labels and embeddings
+        all_labels = torch.cat(all_labels, dim=0).numpy()
+        final_embeds = {t: torch.cat(embeds, dim=0).detach().numpy() for t, embeds in embeds_by_T.items()}
+        
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # Use more folds for better evaluation (5 instead of 2)
+        n_splits = min(5, len(all_labels) // 2)  # Ensure we have enough samples per fold
+        kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        
+        auc_list = []
+        acc_list = []
+        sen_list = []
+        spe_list = []
+        f1_list = []
+        from sklearn.metrics import balanced_accuracy_score, matthews_corrcoef
+        bal_acc_list = []
+        mcc_list = []
+        
+        # For each fold in cross-validation
+        for fold_idx, (train_idx, test_idx) in enumerate(kf.split(final_embeds[T_values[0]], all_labels)):
+            # Store raw probability scores for each timestep
+            timestep_scores_test = []  # store per-timestep test scores
+            timestep_scores_train = []  # store per-timestep train scores
+            
+            # Process each timestep
+            for t_val in T_values:
+                x_train, x_test = final_embeds[t_val][train_idx], final_embeds[t_val][test_idx]
+                y_train, y_test = all_labels[train_idx], all_labels[test_idx]
+                
+                # Use multiple classifiers
+                classifiers = [
+                    SVC(probability=True, C=1.0, kernel='rbf', class_weight='balanced', random_state=42),
+                    LogisticRegression(max_iter=1000, C=1.0, class_weight='balanced', solver='lbfgs', random_state=42),
+                    # Add a third classifier for better ensemble
+                    SVC(probability=True, C=0.5, kernel='linear', class_weight='balanced', random_state=42)
+                ]
+                
+                # Collect scores and predictions from each classifier
+                clf_scores = []
+                clf_preds = []
+                train_score_list = [] # Store train scores for threshold optimisation
+                
+                for clf_idx, clf in enumerate(classifiers):
+                    try:
+                        clf.fit(x_train, y_train)
+                        
+                        # Get probability scores (not binary predictions)
+                        if hasattr(clf, 'predict_proba'):
+                            proba_train = clf.predict_proba(x_train)
+                            proba_test = clf.predict_proba(x_test)
+                            # Handle both binary and multi-class cases
+                            if proba_train.shape[1] == 2:
+                                tr_scores = proba_train[:, 1]
+                                te_scores = proba_test[:, 1]
+                            else:
+                                tr_scores = proba_train.max(axis=1)
+                                te_scores = proba_test.max(axis=1)
+                        elif hasattr(clf, 'decision_function'):
+                            tr_raw = clf.decision_function(x_train)
+                            te_raw = clf.decision_function(x_test)
+                            # Normalize to [0, 1] range using sigmoid
+                            tr_scores = 1 / (1 + np.exp(-tr_raw))
+                            te_scores = 1 / (1 + np.exp(-te_raw))
+                        else:
+                            tr_scores = clf.predict(x_train).astype(float)
+                            te_scores = clf.predict(x_test).astype(float)
+                        
+                        preds = clf.predict(x_test)
+                        
+                        clf_scores.append(te_scores)
+                        clf_preds.append(preds)
+                        train_score_list.append(tr_scores) # correct train scores
+                        
+                    except Exception as e:
+                        print(f"Warning: Classifier {clf_idx} failed: {e}")
+                        # Use dummy predictions as fallback
+                        clf_scores.append(np.full(len(x_test), 0.5))
+                        clf_preds.append(np.zeros(len(x_test), dtype=int))
+                        train_score_list.append(np.full(len(x_train), 0.5)) # Store dummy train scores
+                
+                # Average the probability scores (not the binary predictions)
+                if clf_scores:
+                    avg_scores_test = np.mean(clf_scores, axis=0)
+                    timestep_scores_test.append(avg_scores_test)
+                    # Capture analogous train scores for threshold search
+                    #   we reuse the first classifier's probability of train set as proxy if others failed
+                    avg_scores_train = np.mean(train_score_list, axis=0) if train_score_list else np.zeros_like(y_train, dtype=float)
+                    timestep_scores_train.append(avg_scores_train)
+                    
+                    # For predictions, use majority voting instead of averaging
+                    preds_array = np.array(clf_preds)
+                    majority_preds = np.zeros(len(x_test), dtype=int)
+                    for i in range(len(x_test)):
+                        # Count votes for each class
+                        unique, counts = np.unique(preds_array[:, i], return_counts=True)
+                        # Select the class with most votes
+                        majority_preds[i] = unique[np.argmax(counts)]
+                    
+                    # timestep_predictions.append(majority_preds) # This line is no longer needed
+            
+            # ----- Aggregate across timesteps -----
+            if timestep_scores_test:
+                final_scores_test = np.mean(timestep_scores_test, axis=0)
+                final_scores_train = np.mean(timestep_scores_train, axis=0)
+                
+                # --- Per-fold threshold optimisation on train scores to maximise F1 ---
+                thr_candidates = np.linspace(final_scores_train.min(), final_scores_train.max(), 101)
+                best_thr, best_f1 = 0.5, -1.0
+                for thr in thr_candidates:
+                    f1_tmp = f1_score(y_train, final_scores_train >= thr, zero_division=0)
+                    if f1_tmp > best_f1:
+                        best_f1, best_thr = f1_tmp, thr
+                
+                # Apply threshold to test scores
+                final_predictions = (final_scores_test >= best_thr).astype(int)
+                final_scores = final_scores_test
+                
+                try:
+                    # Compute metrics using continuous scores for AUC
+                    auc = roc_auc_score(y_test, final_scores)
+                    acc = accuracy_score(y_test, final_predictions)
+                    f1 = f1_score(y_test, final_predictions)
+                    
+                    # Compute confusion matrix
+                    tn, fp, fn, tp = confusion_matrix(y_test, final_predictions).ravel()
+                    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+                    
+                    auc_list.append(auc)
+                    acc_list.append(acc)
+                    sen_list.append(sensitivity)
+                    spe_list.append(specificity)
+                    f1_list.append(f1)
+                    
+                except Exception as e:
+                    print(f"Error computing metrics for fold {fold_idx}: {e}")
+        
+        if auc_list:
+            return {
+                'auc': (np.mean(auc_list), np.std(auc_list)),
+                'acc': (np.mean(acc_list), np.std(acc_list)),
+                'sen': (np.mean(sen_list), np.std(sen_list)),
+                'spe': (np.mean(spe_list), np.std(spe_list)),
+                'f1': (np.mean(f1_list), np.std(f1_list))
+            }
+        else:
+            print("WARNING: Evaluation failed completely!")
+            return {
+                'auc': (0.0, 0.0),
+                'acc': (0.0, 0.0),
+                'sen': (0.0, 0.0),
+                'spe': (0.0, 0.0),
+                'f1': (0.0, 0.0)
+            }
+    except Exception as e:
+        print(f"Error in evaluation: {e}")
+        return {
+            'auc': (0.0, 0.0),
+            'acc': (0.0, 0.0),
+            'sen': (0.0, 0.0),
+            'spe': (0.0, 0.0),
+            'f1': (0.0, 0.0)
+        }
 
 
 # =========================================================================
@@ -748,7 +825,7 @@ if __name__ == '__main__':
     parser.add_argument('-batchSize', dest="batchSize", default=8, type=int) # Larger batch for stability
     parser.add_argument('-device', dest="device", default="cuda:0")
     parser.add_argument('-graphEmDim', dest="graphEmDim", default= 768, type=int) # Increased embedding dim
-    parser.add_argument('-dataset', dest="dataset", default="PPMI")
+    parser.add_argument('-dataset', dest="dataset", default="Multi")
     parser.add_argument('-num_views', dest="num_views", default=2, type=int)
     args = parser.parse_args()
 
@@ -836,29 +913,29 @@ if __name__ == '__main__':
     vae_decoder = ClassificationDecoder(args.graphEmDim, 768, 1, dropout_rate=0.3)  # Reduced capacity + more dropout
     vae_model = StagedSupervisedVAE(vae_encoder, vae_decoder).to(device)
     
-    # More conservative optimizer settings
-    optimizer_vae = torch.optim.AdamW(vae_model.parameters(), lr=args.lr * 0.5, weight_decay=1e-3, betas=(0.9, 0.999))
+    # # More conservative optimizer settings
+    # optimizer_vae = torch.optim.AdamW(vae_model.parameters(), lr=args.lr * 0.5, weight_decay=1e-3, betas=(0.9, 0.999))
     
-    # Cosine annealing with warmup for better convergence
-    total_steps = (len(train_data.list_adjs) // args.batchSize) * args.epoch_number
-    warmup_steps = total_steps // 10  # 10% warmup
+    # # Cosine annealing with warmup for better convergence
+    # total_steps = (len(train_data.list_adjs) // args.batchSize) * args.epoch_number
+    # warmup_steps = total_steps // 10  # 10% warmup
     
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return step / warmup_steps
-        else:
-            progress = (step - warmup_steps) / (total_steps - warmup_steps)
-            return 0.5 * (1 + np.cos(np.pi * progress))
+    # def lr_lambda(step):
+    #     if step < warmup_steps:
+    #         return step / warmup_steps
+    #     else:
+    #         progress = (step - warmup_steps) / (total_steps - warmup_steps)
+    #         return 0.5 * (1 + np.cos(np.pi * progress))
     
-    scheduler_vae = torch.optim.lr_scheduler.LambdaLR(optimizer_vae, lr_lambda)
+    # scheduler_vae = torch.optim.lr_scheduler.LambdaLR(optimizer_vae, lr_lambda)
 
-    # More conservative KL annealing parameters
-    kl_beta = 0.0
-    kl_anneal_epochs = 100  # Much longer annealing period
-    steps_per_epoch = max(1, len(train_data.list_adjs) // args.batchSize)
-    kl_anneal_steps = steps_per_epoch * kl_anneal_epochs
-    kl_anneal_rate = 0.5 / kl_anneal_steps if kl_anneal_steps > 0 else 0.5  # Slower annealing to max 0.5
-    print(f"KL Annealing will occur over the first {kl_anneal_epochs} epochs to max beta=0.5.")
+    # # More conservative KL annealing parameters
+    # kl_beta = 0.0
+    # kl_anneal_epochs = 100  # Much longer annealing period
+    # steps_per_epoch = max(1, len(train_data.list_adjs) // args.batchSize)
+    # kl_anneal_steps = steps_per_epoch * kl_anneal_epochs
+    # kl_anneal_rate = 0.5 / kl_anneal_steps if kl_anneal_steps > 0 else 0.5  # Slower annealing to max 0.5
+    # print(f"KL Annealing will occur over the first {kl_anneal_epochs} epochs to max beta=0.5.")
 
     best_test_auc = 0.0
     best_epoch = 0
@@ -868,112 +945,112 @@ if __name__ == '__main__':
     os.makedirs(checkpoint_dir, exist_ok=True)
     best_model_path = os.path.join(checkpoint_dir, "best_stage1_model.pt")
 
-    print("\n--- Starting Stage 1: Supervised Pre-training ---")
-    for epoch in range(args.epoch_number):
-        vae_model.train()
-        train_data.shuffle()
+    # print("\n--- Starting Stage 1: Supervised Pre-training ---")
+    # for epoch in range(args.epoch_number):
+    #     vae_model.train()
+    #     train_data.shuffle()
         
-        epoch_total_loss, epoch_class_loss, epoch_kl_loss = 0, 0, 0
-        num_batches = 0
+    #     epoch_total_loss, epoch_class_loss, epoch_kl_loss = 0, 0, 0
+    #     num_batches = 0
 
-        for i in range(0, len(train_data.list_adjs), args.batchSize):
-            from_ = i
-            to_ = i + args.batchSize
+    #     for i in range(0, len(train_data.list_adjs), args.batchSize):
+    #         from_ = i
+    #         to_ = i + args.batchSize
             
-            # Get batch data with labels
-            adj_batch, x_batch, _, _, _, labels_batch = train_data.get__(from_, to_, self_for_none=True, get_labels=True)
-            target_labels = torch.tensor(labels_batch, device=device)
+    #         # Get batch data with labels
+    #         adj_batch, x_batch, _, _, _, labels_batch = train_data.get__(from_, to_, self_for_none=True, get_labels=True)
+    #         target_labels = torch.tensor(labels_batch, device=device)
 
-            # Prepare inputs for the model
-            x_s_tensor = torch.stack(x_batch).to(device)
-            features_for_dgl = x_s_tensor.view(-1, in_feature_dim)
+    #         # Prepare inputs for the model
+    #         x_s_tensor = torch.stack(x_batch).to(device)
+    #         features_for_dgl = x_s_tensor.view(-1, in_feature_dim)
             
-            dgl_graphs_per_view = []
-            for v in range(args.num_views):
-                view_graphs_in_batch = [dgl.from_scipy(sp.csr_matrix(g[v].cpu().numpy())) for g in adj_batch]
-                dgl_graphs_per_view.append(dgl.batch(view_graphs_in_batch).to(device))
+    #         dgl_graphs_per_view = []
+    #         for v in range(args.num_views):
+    #             view_graphs_in_batch = [dgl.from_scipy(sp.csr_matrix(g[v].cpu().numpy())) for g in adj_batch]
+    #             dgl_graphs_per_view.append(dgl.batch(view_graphs_in_batch).to(device))
             
-            batchSize_info = [len(adj_batch), adj_batch[0].shape[-1]]
+    #         batchSize_info = [len(adj_batch), adj_batch[0].shape[-1]]
 
-            # Update KL Beta (slower annealing to prevent collapse)
-            if kl_beta < 0.5:
-                kl_beta = min(0.5, kl_beta + kl_anneal_rate)
+    #         # Update KL Beta (slower annealing to prevent collapse)
+    #         if kl_beta < 0.5:
+    #             kl_beta = min(0.5, kl_beta + kl_anneal_rate)
 
-            # Forward pass, loss calculation, backward pass
-            optimizer_vae.zero_grad()
-            predicted_logits, mean, log_std, _ = vae_model(dgl_graphs_per_view, features_for_dgl, batchSize_info)
-            total_loss, class_loss, kl_loss = SupervisedVAELoss(predicted_logits, target_labels, mean, log_std, kl_beta)
+    #         # Forward pass, loss calculation, backward pass
+    #         optimizer_vae.zero_grad()
+    #         predicted_logits, mean, log_std, _ = vae_model(dgl_graphs_per_view, features_for_dgl, batchSize_info)
+    #         total_loss, class_loss, kl_loss = SupervisedVAELoss(predicted_logits, target_labels, mean, log_std, kl_beta)
             
-            total_loss.backward()
-            # More aggressive gradient clipping for stability
-            torch.nn.utils.clip_grad_norm_(vae_model.parameters(), max_norm=0.5)
-            optimizer_vae.step()
-            scheduler_vae.step()  # Step-wise learning rate update
+    #         total_loss.backward()
+    #         # More aggressive gradient clipping for stability
+    #         torch.nn.utils.clip_grad_norm_(vae_model.parameters(), max_norm=0.5)
+    #         optimizer_vae.step()
+    #         scheduler_vae.step()  # Step-wise learning rate update
 
-            epoch_total_loss += total_loss.item()
-            epoch_class_loss += class_loss.item()
-            epoch_kl_loss += kl_loss.item()
-            num_batches += 1
+    #         epoch_total_loss += total_loss.item()
+    #         epoch_class_loss += class_loss.item()
+    #         epoch_kl_loss += kl_loss.item()
+    #         num_batches += 1
 
-        # End of epoch evaluation
-        avg_total_loss = epoch_total_loss / num_batches
-        avg_class_loss = epoch_class_loss / num_batches
-        avg_kl_loss = epoch_kl_loss / num_batches
+    #     # End of epoch evaluation
+    #     avg_total_loss = epoch_total_loss / num_batches
+    #     avg_class_loss = epoch_class_loss / num_batches
+    #     avg_kl_loss = epoch_kl_loss / num_batches
         
-        # Evaluate on test set
-        vae_model.eval()
-        all_preds, all_labels = [], []
-        with torch.no_grad():
-            for i_test in range(0, len(test_data.list_adjs), args.batchSize):
-                from_test = i_test
-                to_test = i_test + args.batchSize
+    #     # Evaluate on test set
+    #     vae_model.eval()
+    #     all_preds, all_labels = [], []
+    #     with torch.no_grad():
+    #         for i_test in range(0, len(test_data.list_adjs), args.batchSize):
+    #             from_test = i_test
+    #             to_test = i_test + args.batchSize
                 
-                adj_test, x_test, _, _, _, labels_test = test_data.get__(from_test, to_test, self_for_none=True, get_labels=True)
+    #             adj_test, x_test, _, _, _, labels_test = test_data.get__(from_test, to_test, self_for_none=True, get_labels=True)
                 
-                x_s_tensor_test = torch.stack(x_test).to(device)
-                features_dgl_test = x_s_tensor_test.view(-1, in_feature_dim)
-                dgl_views_test = [dgl.batch([dgl.from_scipy(sp.csr_matrix(g[v].cpu().numpy())) for g in adj_test]).to(device) for v in range(args.num_views)]
-                batchSize_info_test = [len(adj_test), adj_test[0].shape[-1]]
+    #             x_s_tensor_test = torch.stack(x_test).to(device)
+    #             features_dgl_test = x_s_tensor_test.view(-1, in_feature_dim)
+    #             dgl_views_test = [dgl.batch([dgl.from_scipy(sp.csr_matrix(g[v].cpu().numpy())) for g in adj_test]).to(device) for v in range(args.num_views)]
+    #             batchSize_info_test = [len(adj_test), adj_test[0].shape[-1]]
 
-                _, mean_test, _, _ = vae_model(dgl_views_test, features_dgl_test, batchSize_info_test)
-                test_logits = vae_model.decoder(mean_test)
+    #             _, mean_test, _, _ = vae_model(dgl_views_test, features_dgl_test, batchSize_info_test)
+    #             test_logits = vae_model.decoder(mean_test)
                 
-                all_preds.append(torch.sigmoid(test_logits).cpu())
-                all_labels.append(torch.tensor(labels_test))
+    #             all_preds.append(torch.sigmoid(test_logits).cpu())
+    #             all_labels.append(torch.tensor(labels_test))
 
-        all_preds = torch.cat(all_preds).numpy().ravel()
-        all_labels = torch.cat(all_labels).numpy().ravel()
-        auc = roc_auc_score(all_labels, all_preds)
+    #     all_preds = torch.cat(all_preds).numpy().ravel()
+    #     all_labels = torch.cat(all_labels).numpy().ravel()
+    #     auc = roc_auc_score(all_labels, all_preds)
 
-        if auc > best_test_auc:
-            best_test_auc = auc
-            best_epoch = epoch + 1
-            patience_counter = 0
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': vae_model.state_dict(),
-                'optimizer_state_dict': optimizer_vae.state_dict(),
-                'scheduler_state_dict': scheduler_vae.state_dict(),
-                'test_auc': auc,
-                'kl_beta': kl_beta,
-                'args': args
-            }, best_model_path)
-            print(f"  *** New best model saved! Best AUC: {best_test_auc:.4f} at epoch {best_epoch} ***")
-        else:
-            patience_counter += 1
+    #     if auc > best_test_auc:
+    #         best_test_auc = auc
+    #         best_epoch = epoch + 1
+    #         patience_counter = 0
+    #         torch.save({
+    #             'epoch': epoch,
+    #             'model_state_dict': vae_model.state_dict(),
+    #             'optimizer_state_dict': optimizer_vae.state_dict(),
+    #             'scheduler_state_dict': scheduler_vae.state_dict(),
+    #             'test_auc': auc,
+    #             'kl_beta': kl_beta,
+    #             'args': args
+    #         }, best_model_path)
+    #         print(f"  *** New best model saved! Best AUC: {best_test_auc:.4f} at epoch {best_epoch} ***")
+    #     else:
+    #         patience_counter += 1
             
-        # Early stopping
-        if patience_counter >= patience:
-            print(f"Early stopping at epoch {epoch+1}. No improvement for {patience} epochs.")
-            break
+    #     # Early stopping
+    #     if patience_counter >= patience:
+    #         print(f"Early stopping at epoch {epoch+1}. No improvement for {patience} epochs.")
+    #         break
 
-        print(f"Epoch: {epoch+1:03d} | Avg Loss: {avg_total_loss:.4f} | Class Loss: {avg_class_loss:.4f} | "
-              f"KL Loss: {avg_kl_loss:.4f} | Beta: {kl_beta:.3f} | Test AUC: {auc:.4f} | LR: {optimizer_vae.param_groups[0]['lr']:.2e}")
+    #     print(f"Epoch: {epoch+1:03d} | Avg Loss: {avg_total_loss:.4f} | Class Loss: {avg_class_loss:.4f} | "
+    #           f"KL Loss: {avg_kl_loss:.4f} | Beta: {kl_beta:.3f} | Test AUC: {auc:.4f} | LR: {optimizer_vae.param_groups[0]['lr']:.2e}")
 
-    print("--- STAGE 1 Finished. VAE model is ready. ---")
-    # Clean up optimizer memory
-    del optimizer_vae, scheduler_vae
-    torch.cuda.empty_cache()
+    # print("--- STAGE 1 Finished. VAE model is ready. ---")
+    # # Clean up optimizer memory
+    # del optimizer_vae, scheduler_vae
+    # torch.cuda.empty_cache()
     
     # Load the best model
     if os.path.exists(best_model_path):
@@ -1242,8 +1319,15 @@ if __name__ == '__main__':
             
             # Enhanced evaluation with more focus on model quality
             # Use the complete training data for stratified k-fold cross-validation to get smoother AUC values
-            auc_mean, auc_std = evaluate_with_svm(eval_model, ddm_test_loader, eval_T_values, device)
-            print(f"Epoch {epoch+1:03d} | Avg Loss: {avg_loss:.4f} | CV AUC (SVM): {auc_mean:.4f} ± {auc_std:.4f} | LR: {optimizer_ddm.param_groups[0]['lr']:.2e}")
+            metrics = evaluate_with_svm(eval_model, ddm_test_loader, eval_T_values, device)
+            auc_mean, auc_std = metrics['auc']
+            acc_mean, acc_std = metrics['acc']
+            sen_mean, sen_std = metrics['sen']
+            spe_mean, spe_std = metrics['spe']
+            f1_mean, f1_std = metrics['f1']
+            print(f"Epoch {epoch+1:03d} | Loss: {avg_loss:.4f} | LR: {optimizer_ddm.param_groups[0]['lr']:.2e}")
+            print(f"  AUC: {auc_mean:.4f}±{auc_std:.4f} | ACC: {acc_mean:.4f}±{acc_std:.4f} | F1: {f1_mean:.4f}±{f1_std:.4f}")
+            print(f"  SEN: {sen_mean:.4f}±{sen_std:.4f} | SPE: {spe_mean:.4f}±{spe_std:.4f}")
             
             if auc_mean > best_val_auc:
                 improvement = auc_mean - best_val_auc
@@ -1402,4 +1486,3 @@ try:
     visualize_tsne_classification(model_for_vis, ddm_train_loader, ddm_test_loader, tsne_T, device)
 except Exception as e:
     print(f"t-SNE visualisation failed: {e}")
-

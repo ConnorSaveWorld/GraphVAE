@@ -820,7 +820,7 @@ if __name__ == '__main__':
     parser.add_argument('-batchSize', dest="batchSize", default=8, type=int) # Larger batch for stability
     parser.add_argument('-device', dest="device", default="cuda:0")
     parser.add_argument('-graphEmDim', dest="graphEmDim", default= 768, type=int) # Increased embedding dim
-    parser.add_argument('-dataset', dest="dataset", default="PPMI")
+    parser.add_argument('-dataset', dest="dataset", default="Multi")
     parser.add_argument('-num_views', dest="num_views", default=2, type=int)
     args = parser.parse_args()
 
@@ -911,29 +911,29 @@ if __name__ == '__main__':
     vae_decoder = ClassificationDecoder(args.graphEmDim, 768, 1, dropout_rate=0.3)  # Reduced capacity + more dropout
     vae_model = StagedSupervisedVAE(vae_encoder, vae_decoder).to(device)
     
-    # More conservative optimizer settings
-    optimizer_vae = torch.optim.AdamW(vae_model.parameters(), lr=args.lr * 0.5, weight_decay=1e-3, betas=(0.9, 0.999))
+    # # More conservative optimizer settings
+    # optimizer_vae = torch.optim.AdamW(vae_model.parameters(), lr=args.lr * 0.5, weight_decay=1e-3, betas=(0.9, 0.999))
     
-    # Cosine annealing with warmup for better convergence
-    total_steps = (len(train_data.list_adjs) // args.batchSize) * args.epoch_number
-    warmup_steps = total_steps // 10  # 10% warmup
+    # # Cosine annealing with warmup for better convergence
+    # total_steps = (len(train_data.list_adjs) // args.batchSize) * args.epoch_number
+    # warmup_steps = total_steps // 10  # 10% warmup
     
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return step / warmup_steps
-        else:
-            progress = (step - warmup_steps) / (total_steps - warmup_steps)
-            return 0.5 * (1 + np.cos(np.pi * progress))
+    # def lr_lambda(step):
+    #     if step < warmup_steps:
+    #         return step / warmup_steps
+    #     else:
+    #         progress = (step - warmup_steps) / (total_steps - warmup_steps)
+    #         return 0.5 * (1 + np.cos(np.pi * progress))
     
-    scheduler_vae = torch.optim.lr_scheduler.LambdaLR(optimizer_vae, lr_lambda)
+    # scheduler_vae = torch.optim.lr_scheduler.LambdaLR(optimizer_vae, lr_lambda)
 
-    # More conservative KL annealing parameters
-    kl_beta = 0.0
-    kl_anneal_epochs = 100  # Much longer annealing period
-    steps_per_epoch = max(1, len(train_data.list_adjs) // args.batchSize)
-    kl_anneal_steps = steps_per_epoch * kl_anneal_epochs
-    kl_anneal_rate = 0.5 / kl_anneal_steps if kl_anneal_steps > 0 else 0.5  # Slower annealing to max 0.5
-    print(f"KL Annealing will occur over the first {kl_anneal_epochs} epochs to max beta=0.5.")
+    # # More conservative KL annealing parameters
+    # kl_beta = 0.0
+    # kl_anneal_epochs = 100  # Much longer annealing period
+    # steps_per_epoch = max(1, len(train_data.list_adjs) // args.batchSize)
+    # kl_anneal_steps = steps_per_epoch * kl_anneal_epochs
+    # kl_anneal_rate = 0.5 / kl_anneal_steps if kl_anneal_steps > 0 else 0.5  # Slower annealing to max 0.5
+    # print(f"KL Annealing will occur over the first {kl_anneal_epochs} epochs to max beta=0.5.")
 
     best_test_auc = 0.0
     best_epoch = 0
@@ -943,112 +943,112 @@ if __name__ == '__main__':
     os.makedirs(checkpoint_dir, exist_ok=True)
     best_model_path = os.path.join(checkpoint_dir, "best_stage1_model.pt")
 
-    print("\n--- Starting Stage 1: Supervised Pre-training ---")
-    for epoch in range(args.epoch_number):
-        vae_model.train()
-        train_data.shuffle()
+    # print("\n--- Starting Stage 1: Supervised Pre-training ---")
+    # for epoch in range(args.epoch_number):
+    #     vae_model.train()
+    #     train_data.shuffle()
         
-        epoch_total_loss, epoch_class_loss, epoch_kl_loss = 0, 0, 0
-        num_batches = 0
+    #     epoch_total_loss, epoch_class_loss, epoch_kl_loss = 0, 0, 0
+    #     num_batches = 0
 
-        for i in range(0, len(train_data.list_adjs), args.batchSize):
-            from_ = i
-            to_ = i + args.batchSize
+    #     for i in range(0, len(train_data.list_adjs), args.batchSize):
+    #         from_ = i
+    #         to_ = i + args.batchSize
             
-            # Get batch data with labels
-            adj_batch, x_batch, _, _, _, labels_batch = train_data.get__(from_, to_, self_for_none=True, get_labels=True)
-            target_labels = torch.tensor(labels_batch, device=device)
+    #         # Get batch data with labels
+    #         adj_batch, x_batch, _, _, _, labels_batch = train_data.get__(from_, to_, self_for_none=True, get_labels=True)
+    #         target_labels = torch.tensor(labels_batch, device=device)
 
-            # Prepare inputs for the model
-            x_s_tensor = torch.stack(x_batch).to(device)
-            features_for_dgl = x_s_tensor.view(-1, in_feature_dim)
+    #         # Prepare inputs for the model
+    #         x_s_tensor = torch.stack(x_batch).to(device)
+    #         features_for_dgl = x_s_tensor.view(-1, in_feature_dim)
             
-            dgl_graphs_per_view = []
-            for v in range(args.num_views):
-                view_graphs_in_batch = [dgl.from_scipy(sp.csr_matrix(g[v].cpu().numpy())) for g in adj_batch]
-                dgl_graphs_per_view.append(dgl.batch(view_graphs_in_batch).to(device))
+    #         dgl_graphs_per_view = []
+    #         for v in range(args.num_views):
+    #             view_graphs_in_batch = [dgl.from_scipy(sp.csr_matrix(g[v].cpu().numpy())) for g in adj_batch]
+    #             dgl_graphs_per_view.append(dgl.batch(view_graphs_in_batch).to(device))
             
-            batchSize_info = [len(adj_batch), adj_batch[0].shape[-1]]
+    #         batchSize_info = [len(adj_batch), adj_batch[0].shape[-1]]
 
-            # Update KL Beta (slower annealing to prevent collapse)
-            if kl_beta < 0.5:
-                kl_beta = min(0.5, kl_beta + kl_anneal_rate)
+    #         # Update KL Beta (slower annealing to prevent collapse)
+    #         if kl_beta < 0.5:
+    #             kl_beta = min(0.5, kl_beta + kl_anneal_rate)
 
-            # Forward pass, loss calculation, backward pass
-            optimizer_vae.zero_grad()
-            predicted_logits, mean, log_std, _ = vae_model(dgl_graphs_per_view, features_for_dgl, batchSize_info)
-            total_loss, class_loss, kl_loss = SupervisedVAELoss(predicted_logits, target_labels, mean, log_std, kl_beta)
+    #         # Forward pass, loss calculation, backward pass
+    #         optimizer_vae.zero_grad()
+    #         predicted_logits, mean, log_std, _ = vae_model(dgl_graphs_per_view, features_for_dgl, batchSize_info)
+    #         total_loss, class_loss, kl_loss = SupervisedVAELoss(predicted_logits, target_labels, mean, log_std, kl_beta)
             
-            total_loss.backward()
-            # More aggressive gradient clipping for stability
-            torch.nn.utils.clip_grad_norm_(vae_model.parameters(), max_norm=0.5)
-            optimizer_vae.step()
-            scheduler_vae.step()  # Step-wise learning rate update
+    #         total_loss.backward()
+    #         # More aggressive gradient clipping for stability
+    #         torch.nn.utils.clip_grad_norm_(vae_model.parameters(), max_norm=0.5)
+    #         optimizer_vae.step()
+    #         scheduler_vae.step()  # Step-wise learning rate update
 
-            epoch_total_loss += total_loss.item()
-            epoch_class_loss += class_loss.item()
-            epoch_kl_loss += kl_loss.item()
-            num_batches += 1
+    #         epoch_total_loss += total_loss.item()
+    #         epoch_class_loss += class_loss.item()
+    #         epoch_kl_loss += kl_loss.item()
+    #         num_batches += 1
 
-        # End of epoch evaluation
-        avg_total_loss = epoch_total_loss / num_batches
-        avg_class_loss = epoch_class_loss / num_batches
-        avg_kl_loss = epoch_kl_loss / num_batches
+    #     # End of epoch evaluation
+    #     avg_total_loss = epoch_total_loss / num_batches
+    #     avg_class_loss = epoch_class_loss / num_batches
+    #     avg_kl_loss = epoch_kl_loss / num_batches
         
-        # Evaluate on test set
-        vae_model.eval()
-        all_preds, all_labels = [], []
-        with torch.no_grad():
-            for i_test in range(0, len(test_data.list_adjs), args.batchSize):
-                from_test = i_test
-                to_test = i_test + args.batchSize
+    #     # Evaluate on test set
+    #     vae_model.eval()
+    #     all_preds, all_labels = [], []
+    #     with torch.no_grad():
+    #         for i_test in range(0, len(test_data.list_adjs), args.batchSize):
+    #             from_test = i_test
+    #             to_test = i_test + args.batchSize
                 
-                adj_test, x_test, _, _, _, labels_test = test_data.get__(from_test, to_test, self_for_none=True, get_labels=True)
+    #             adj_test, x_test, _, _, _, labels_test = test_data.get__(from_test, to_test, self_for_none=True, get_labels=True)
                 
-                x_s_tensor_test = torch.stack(x_test).to(device)
-                features_dgl_test = x_s_tensor_test.view(-1, in_feature_dim)
-                dgl_views_test = [dgl.batch([dgl.from_scipy(sp.csr_matrix(g[v].cpu().numpy())) for g in adj_test]).to(device) for v in range(args.num_views)]
-                batchSize_info_test = [len(adj_test), adj_test[0].shape[-1]]
+    #             x_s_tensor_test = torch.stack(x_test).to(device)
+    #             features_dgl_test = x_s_tensor_test.view(-1, in_feature_dim)
+    #             dgl_views_test = [dgl.batch([dgl.from_scipy(sp.csr_matrix(g[v].cpu().numpy())) for g in adj_test]).to(device) for v in range(args.num_views)]
+    #             batchSize_info_test = [len(adj_test), adj_test[0].shape[-1]]
 
-                _, mean_test, _, _ = vae_model(dgl_views_test, features_dgl_test, batchSize_info_test)
-                test_logits = vae_model.decoder(mean_test)
+    #             _, mean_test, _, _ = vae_model(dgl_views_test, features_dgl_test, batchSize_info_test)
+    #             test_logits = vae_model.decoder(mean_test)
                 
-                all_preds.append(torch.sigmoid(test_logits).cpu())
-                all_labels.append(torch.tensor(labels_test))
+    #             all_preds.append(torch.sigmoid(test_logits).cpu())
+    #             all_labels.append(torch.tensor(labels_test))
 
-        all_preds = torch.cat(all_preds).numpy().ravel()
-        all_labels = torch.cat(all_labels).numpy().ravel()
-        auc = roc_auc_score(all_labels, all_preds)
+    #     all_preds = torch.cat(all_preds).numpy().ravel()
+    #     all_labels = torch.cat(all_labels).numpy().ravel()
+    #     auc = roc_auc_score(all_labels, all_preds)
 
-        if auc > best_test_auc:
-            best_test_auc = auc
-            best_epoch = epoch + 1
-            patience_counter = 0
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': vae_model.state_dict(),
-                'optimizer_state_dict': optimizer_vae.state_dict(),
-                'scheduler_state_dict': scheduler_vae.state_dict(),
-                'test_auc': auc,
-                'kl_beta': kl_beta,
-                'args': args
-            }, best_model_path)
-            print(f"  *** New best model saved! Best AUC: {best_test_auc:.4f} at epoch {best_epoch} ***")
-        else:
-            patience_counter += 1
+    #     if auc > best_test_auc:
+    #         best_test_auc = auc
+    #         best_epoch = epoch + 1
+    #         patience_counter = 0
+    #         torch.save({
+    #             'epoch': epoch,
+    #             'model_state_dict': vae_model.state_dict(),
+    #             'optimizer_state_dict': optimizer_vae.state_dict(),
+    #             'scheduler_state_dict': scheduler_vae.state_dict(),
+    #             'test_auc': auc,
+    #             'kl_beta': kl_beta,
+    #             'args': args
+    #         }, best_model_path)
+    #         print(f"  *** New best model saved! Best AUC: {best_test_auc:.4f} at epoch {best_epoch} ***")
+    #     else:
+    #         patience_counter += 1
             
-        # Early stopping
-        if patience_counter >= patience:
-            print(f"Early stopping at epoch {epoch+1}. No improvement for {patience} epochs.")
-            break
+    #     # Early stopping
+    #     if patience_counter >= patience:
+    #         print(f"Early stopping at epoch {epoch+1}. No improvement for {patience} epochs.")
+    #         break
 
-        print(f"Epoch: {epoch+1:03d} | Avg Loss: {avg_total_loss:.4f} | Class Loss: {avg_class_loss:.4f} | "
-              f"KL Loss: {avg_kl_loss:.4f} | Beta: {kl_beta:.3f} | Test AUC: {auc:.4f} | LR: {optimizer_vae.param_groups[0]['lr']:.2e}")
+    #     print(f"Epoch: {epoch+1:03d} | Avg Loss: {avg_total_loss:.4f} | Class Loss: {avg_class_loss:.4f} | "
+    #           f"KL Loss: {avg_kl_loss:.4f} | Beta: {kl_beta:.3f} | Test AUC: {auc:.4f} | LR: {optimizer_vae.param_groups[0]['lr']:.2e}")
 
-    print("--- STAGE 1 Finished. VAE model is ready. ---")
-    # Clean up optimizer memory
-    del optimizer_vae, scheduler_vae
-    torch.cuda.empty_cache()
+    # print("--- STAGE 1 Finished. VAE model is ready. ---")
+    # # Clean up optimizer memory
+    # del optimizer_vae, scheduler_vae
+    # torch.cuda.empty_cache()
     
     # Load the best model
     if os.path.exists(best_model_path):
@@ -1188,7 +1188,7 @@ if __name__ == '__main__':
     # ========================================================================
     print(f"\n--- STAGE 2: Training DDM Feature Enhancer ---")
     # Use a minimal batch size to avoid memory issues
-    memory_safe_batch_size = 16  
+    memory_safe_batch_size = 8
     print(f"Using minimal batch size {memory_safe_batch_size} for DDM training")
     
     # Data loaders with minimal overhead
