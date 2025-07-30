@@ -34,6 +34,7 @@ from sklearn.metrics import silhouette_score, davies_bouldin_score
 from matplotlib.lines import Line2D
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE 
+from sklearn.calibration import CalibratedClassifierCV
 
 # --- Suppress specific warnings ---
 warnings.filterwarnings("ignore", message="It is not recommended to directly access the internal storage format")
@@ -656,7 +657,7 @@ def evaluate_with_svm(model, data_loader, T_values, device):
             torch.cuda.empty_cache()
         
         # Use more folds for better evaluation (5 instead of 2)
-        n_splits = min(5, len(all_labels) // 2)  # Ensure we have enough samples per fold
+        n_splits = min(3, len(all_labels) // 2)  # Ensure we have enough samples per fold
         kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
         
         auc_list = []
@@ -690,17 +691,42 @@ def evaluate_with_svm(model, data_loader, T_values, device):
                 # Collect scores and predictions from each classifier
                 clf_scores = []
                 clf_preds = []
-                train_score_list = [] # Store train scores for threshold optimisation
-                
+                train_score_list = []
+                clf_weights = []  # NEW: Store weights for each classifier
+
                 for clf_idx, clf in enumerate(classifiers):
                     try:
+                        # Use stratified k-fold to evaluate classifier performance on training data
+                        cv_folds = min(3, max(2, len(y_train) // 10))  # Ensure we have at least 2 folds because StratifiedKFold requires n_splits >= 2
+                        skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+        
+        # Calculate F1 score via cross-validation
+                        f1_scores = []
+                        for train_idx_cv, val_idx_cv in skf.split(x_train, y_train):
+                            x_train_cv, x_val_cv = x_train[train_idx_cv], x_train[val_idx_cv]
+                            y_train_cv, y_val_cv = y_train[train_idx_cv], y_train[val_idx_cv]
+            
+            # Train on CV fold
+                            clf_cv = clf.__class__(**clf.get_params())
+                            clf_cv.fit(x_train_cv, y_train_cv)
+            
+            # Predict on validation fold
+                            y_pred_cv = clf_cv.predict(x_val_cv)
+                            f1_cv = f1_score(y_val_cv, y_pred_cv, zero_division=0)
+                            f1_scores.append(f1_cv)
+        
+        # Average F1 score as weight
+                        weight = np.mean(f1_scores) if f1_scores else 0.5
+                        clf_weights.append(weight)
+        
+        # Now train on full training set
                         clf.fit(x_train, y_train)
-                        
-                        # Get probability scores (not binary predictions)
+        
+        # Get probability scores (not binary predictions)
                         if hasattr(clf, 'predict_proba'):
                             proba_train = clf.predict_proba(x_train)
                             proba_test = clf.predict_proba(x_test)
-                            # Handle both binary and multi-class cases
+            # Handle both binary and multi-class cases
                             if proba_train.shape[1] == 2:
                                 tr_scores = proba_train[:, 1]
                                 te_scores = proba_test[:, 1]
@@ -710,43 +736,50 @@ def evaluate_with_svm(model, data_loader, T_values, device):
                         elif hasattr(clf, 'decision_function'):
                             tr_raw = clf.decision_function(x_train)
                             te_raw = clf.decision_function(x_test)
-                            # Normalize to [0, 1] range using sigmoid
+            # Normalize to [0, 1] range using sigmoid
                             tr_scores = 1 / (1 + np.exp(-tr_raw))
                             te_scores = 1 / (1 + np.exp(-te_raw))
                         else:
                             tr_scores = clf.predict(x_train).astype(float)
                             te_scores = clf.predict(x_test).astype(float)
-                        
+        
                         preds = clf.predict(x_test)
-                        
+        
                         clf_scores.append(te_scores)
                         clf_preds.append(preds)
-                        train_score_list.append(tr_scores) # correct train scores
-                        
+                        train_score_list.append(tr_scores)
+        
                     except Exception as e:
                         print(f"Warning: Classifier {clf_idx} failed: {e}")
-                        # Use dummy predictions as fallback
+        # Use dummy predictions as fallback
                         clf_scores.append(np.full(len(x_test), 0.5))
                         clf_preds.append(np.zeros(len(x_test), dtype=int))
-                        train_score_list.append(np.full(len(x_train), 0.5)) # Store dummy train scores
-                
-                # Average the probability scores (not the binary predictions)
-                if clf_scores:
-                    avg_scores_test = np.mean(clf_scores, axis=0)
-                    timestep_scores_test.append(avg_scores_test)
-                    # Capture analogous train scores for threshold search
-                    #   we reuse the first classifier's probability of train set as proxy if others failed
-                    avg_scores_train = np.mean(train_score_list, axis=0) if train_score_list else np.zeros_like(y_train, dtype=float)
-                    timestep_scores_train.append(avg_scores_train)
-                    
-                    # For predictions, use majority voting instead of averaging
+                        train_score_list.append(np.full(len(x_train), 0.5))
+                        clf_weights.append(0.0)  # Zero weight for failed classifier
+
+# Weighted average of probability scores
+                if clf_scores and any(w > 0 for w in clf_weights):
+    # Normalize weights to sum to 1
+                    clf_weights = np.array(clf_weights)
+                    clf_weights = clf_weights / (clf_weights.sum() + 1e-8)
+    
+    # Apply weighted average
+                    weighted_scores_test = np.average(clf_scores, axis=0, weights=clf_weights)
+                    timestep_scores_test.append(weighted_scores_test)
+    
+    # Weighted average for train scores
+                    weighted_scores_train = np.average(train_score_list, axis=0, weights=clf_weights) if train_score_list else np.zeros_like(y_train, dtype=float)
+                    timestep_scores_train.append(weighted_scores_train)
+    
+    # For predictions, use weighted voting
                     preds_array = np.array(clf_preds)
                     majority_preds = np.zeros(len(x_test), dtype=int)
                     for i in range(len(x_test)):
-                        # Count votes for each class
-                        unique, counts = np.unique(preds_array[:, i], return_counts=True)
-                        # Select the class with most votes
-                        majority_preds[i] = unique[np.argmax(counts)]
+        # Weighted voting
+                        for class_val in [0, 1]:
+                            class_weights = sum(clf_weights[j] for j in range(len(clf_preds)) if preds_array[j, i] == class_val)
+                            if class_weights > 0.5:  # More than half the weight votes for this class
+                                majority_preds[i] = class_val
                     
                     # timestep_predictions.append(majority_preds) # This line is no longer needed
             
@@ -755,15 +788,33 @@ def evaluate_with_svm(model, data_loader, T_values, device):
                 final_scores_test = np.mean(timestep_scores_test, axis=0)
                 final_scores_train = np.mean(timestep_scores_train, axis=0)
                 
-                # --- Per-fold threshold optimisation on train scores to maximise F1 ---
-                thr_candidates = np.linspace(final_scores_train.min(), final_scores_train.max(), 101)
+                # --- Inner validation split for robust threshold selection ---
+                train_idx_inner, val_idx = train_test_split(
+                    np.arange(len(y_train)),
+                    test_size=0.2,
+                    stratify=y_train,
+                    random_state=42,
+                )
+
+                val_scores = final_scores_train[val_idx]
+                val_labels = y_train[val_idx]
+
+                thr_candidates = np.linspace(0.0, 1.0, 201)
                 best_thr, best_f1 = 0.5, -1.0
                 for thr in thr_candidates:
-                    f1_tmp = f1_score(y_train, final_scores_train >= thr, zero_division=0)
-                    if f1_tmp > best_f1:
-                        best_f1, best_thr = f1_tmp, thr
-                
-                # Apply threshold to test scores
+                    preds_val = val_scores >= thr
+                    # Ensure both classes predicted
+                    if preds_val.sum() < 2 or (~preds_val).sum() < 2:
+                        continue
+                    spec_val = confusion_matrix(val_labels, preds_val)[0,0] / max(1, (
+                        confusion_matrix(val_labels, preds_val)[0,0] + confusion_matrix(val_labels, preds_val)[0,1]))
+                    if spec_val < 0.5:
+                        continue  # require specificity at least 0.5 on validation
+                    f1_val = f1_score(val_labels, preds_val, zero_division=0)
+                    if f1_val > best_f1:
+                        best_f1, best_thr = f1_val, thr
+
+                # Apply threshold chosen on validation set to test scores
                 final_predictions = (final_scores_test >= best_thr).astype(int)
                 final_scores = final_scores_test
                 
@@ -813,6 +864,78 @@ def evaluate_with_svm(model, data_loader, T_values, device):
             'spe': (0.0, 0.0),
             'f1': (0.0, 0.0)
         }
+# --- Simple evaluation helpers ported from eval.py (Option A) ---
+from sklearn.metrics import confusion_matrix, roc_auc_score, accuracy_score, f1_score
+from sklearn.model_selection import StratifiedKFold
+
+def sensitivity_specificity(y_true, y_pred):
+    """Compute sensitivity and specificity given binary labels."""
+    cm = confusion_matrix(y_true, y_pred)
+    tn, fp, fn, tp = cm.ravel()
+    specificity = 0.0 if (tn + fp) == 0 else tn / (tn + fp)
+    sensitivity = 0.0 if (tp + fn) == 0 else tp / (tp + fn)
+    return sensitivity, specificity
+
+def evaluate_ddm(model, data_loader, t_val, device):
+    """Evaluate diffusion model with logistic-regression and classic metrics."""
+    model.eval()
+    avg_pooler = AvgPooling()
+
+    embeds, labels = [], []
+    with torch.no_grad():
+        for batch_g, batch_labels in data_loader:
+            batch_g = batch_g.to(device)
+            node_feats = batch_g.ndata['attr'].to(device)
+            den_nodes = model.embed(batch_g, node_feats, t_val)
+            graph_embed = avg_pooler(batch_g, den_nodes)
+            embeds.append(graph_embed.cpu())
+            labels.append(batch_labels)
+
+    X = torch.cat(embeds, dim=0).numpy()
+    y = torch.cat(labels, dim=0).numpy()
+
+    n_splits = min(5, max(2, len(y) // 2))
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+    aucs, accs, sens, spes, f1s = [], [], [], [], []
+    from sklearn.linear_model import LogisticRegression
+
+    for train_idx, test_idx in skf.split(X, y):
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+
+        clf = LogisticRegression(max_iter=1000, class_weight='balanced', solver='lbfgs', random_state=42)
+        clf.fit(X_train, y_train)
+
+        # --- Adaptive threshold selection to maximise F1 on the training split ---
+        scores_train = clf.predict_proba(X_train)[:, 1]
+        thr_candidates = np.linspace(0.0, 1.0, 101)
+        best_thr, best_f1 = 0.5, -1.0
+        for thr in thr_candidates:
+            preds_train = (scores_train >= thr).astype(int)
+            f1_train = f1_score(y_train, preds_train, zero_division=0)
+            if f1_train > best_f1:
+                best_f1, best_thr = f1_train, thr
+
+        # Apply the selected threshold to the held-out test split
+        scores_test = clf.predict_proba(X_test)[:, 1]
+        preds = (scores_test >= best_thr).astype(int)
+
+        aucs.append(roc_auc_score(y_test, scores_test))
+        accs.append(accuracy_score(y_test, preds))
+        f1s.append(f1_score(y_test, preds, zero_division=0))
+        sen, spe = sensitivity_specificity(y_test, preds)
+        sens.append(sen)
+        spes.append(spe)
+
+    ms = lambda arr: (float(np.mean(arr)), float(np.std(arr)))
+    return {
+        'auc': ms(aucs),
+        'acc': ms(accs),
+        'sen': ms(sens),
+        'spe': ms(spes),
+        'f1': ms(f1s),
+    }
 
 
 # =========================================================================
@@ -825,7 +948,7 @@ if __name__ == '__main__':
     parser.add_argument('-batchSize', dest="batchSize", default=8, type=int) # Larger batch for stability
     parser.add_argument('-device', dest="device", default="cuda:0")
     parser.add_argument('-graphEmDim', dest="graphEmDim", default= 768, type=int) # Increased embedding dim
-    parser.add_argument('-dataset', dest="dataset", default="Multi")
+    parser.add_argument('-dataset', dest="dataset", default="PPMI")
     parser.add_argument('-num_views', dest="num_views", default=2, type=int)
     args = parser.parse_args()
 
@@ -1319,7 +1442,8 @@ if __name__ == '__main__':
             
             # Enhanced evaluation with more focus on model quality
             # Use the complete training data for stratified k-fold cross-validation to get smoother AUC values
-            metrics = evaluate_with_svm(eval_model, ddm_test_loader, eval_T_values, device)
+            # metrics = evaluate_with_svm(eval_model, ddm_test_loader, eval_T_values, device)
+            metrics = evaluate_ddm(eval_model, ddm_test_loader, eval_T_values[1], device)
             auc_mean, auc_std = metrics['auc']
             acc_mean, acc_std = metrics['acc']
             sen_mean, sen_std = metrics['sen']
@@ -1486,3 +1610,4 @@ try:
     visualize_tsne_classification(model_for_vis, ddm_train_loader, ddm_test_loader, tsne_T, device)
 except Exception as e:
     print(f"t-SNE visualisation failed: {e}")
+
