@@ -176,7 +176,7 @@ if args.model == "KernelAugmentedWithTotalNumberOfTriangles" or args.model=="Gra
         step_num = 5
         alpha = [1, 1, 1, 1, 1, 1, 1, 1, 50, 2000]
 
-    elif dataset == "Multi":
+    elif dataset == "Multi" or dataset == "site21" or dataset == "Neuro" or dataset == "PPMI":
         print(f"Setting simple hyperparameters for {dataset}.")
         # Disable kernel statistics for the initial run
         kernl_type = [] 

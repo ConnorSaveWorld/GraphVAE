@@ -231,8 +231,9 @@ class DynamicCouplingEncoder(nn.Module):
         self.stochastic_log_std_layer = node_mlp(GraphLatentDim, [GraphLatentDim])
         
         # --- Multi-Strategy Graph Pooling ---
+        # Project concatenated mean/max/sum pooling (3 * GraphLatentDim) back to GraphLatentDim
         self.pooling_projection = nn.Sequential(
-            nn.Linear(hidden_dim * 3, GraphLatentDim),  # 3 pooling strategies combined
+            nn.Linear(GraphLatentDim * 3, GraphLatentDim),
             nn.GELU(),
             nn.Dropout(0.1)
         )

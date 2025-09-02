@@ -5,7 +5,9 @@ import networkx as nx
 import numpy as np
 import torch
 from scipy.sparse import *
-from  Synthatic_graph_generator import *
+# Restore the standard library 'random' module; scipy.sparse.random shadows it.
+import importlib as _imp
+random = _imp.import_module('random')
 # from util import *
 import os
 import pickle as pkl
@@ -487,18 +489,27 @@ class Datasets():
         # return self.processed_adjs[index], self.processed_Xs[index],torch.tensor(self.list_adjs[index].todense(), dtype=torch.float32)
         return self.processed_adjs[index], self.processed_Xs[index]
 # generate a list of graph
-def list_graph_loader( graph_type, _max_list_size=None, return_labels=False, limited_to=None):
+def list_graph_loader(graph_type, _max_list_size=None, return_labels=False, limited_to=None):
+  """Load a variety of graph datasets in a case-insensitive way."""
+  graph_type_lower = graph_type.lower()  # Normalize for comparison
+
+  # For compatibility with previous code that expects exact names, we retain
+  # the original string (graph_type) when we need to construct paths, etc.
   list_adj = []
   list_x =[]
   list_labels = []
 
-  if graph_type == "Multi":
-    list_adj, list_x, list_labels = load_neuroimaging_data("/root/GraphVAE-MM/dataset/Multi")
-  elif graph_type =="PPMI":
+  if graph_type_lower == "multi":
+    list_adj, list_x, list_labels = load_neuroimaging_data("/root/GraphVAE-MM/dataset/Multi", site_id=16)
+  elif graph_type_lower == "site21":
+    list_adj, list_x, list_labels = load_neuroimaging_data("/root/GraphVAE-MM/dataset/site21", site_id=21)
+  elif graph_type_lower == "ppmi":
     list_adj, list_x, list_labels = load_PPMI("/root/GraphVAE-MM/dataset/PPMI")
+  elif graph_type_lower == "neuro":
+    list_adj, list_x, list_labels = load_neuroimaging_data("/root/autodl-fs/dataset/Neuro", site_id=16)
 
 
-  elif graph_type=="IMDBBINARY":
+  elif graph_type == "IMDBBINARY":
       data = dgl.data.GINDataset(name='IMDBBINARY', self_loop=False)
       graphs, labels = data.graphs, data.labels
       for i, graph in enumerate(graphs):
@@ -509,7 +520,7 @@ def list_graph_loader( graph_type, _max_list_size=None, return_labels=False, lim
       graphs_to_writeOnDisk = [gr.toarray() for gr in list_adj]
       np.save('IMDBBINARY_lattice_graph.npy', graphs_to_writeOnDisk, allow_pickle=True)
 
-  elif graph_type=="NCI1":
+  elif graph_type == "NCI1":
       data = dgl.data.GINDataset(name='NCI1', self_loop=False)
       graphs, labels = data.graphs, data.labels
       for i, graph in enumerate(graphs):
@@ -519,7 +530,7 @@ def list_graph_loader( graph_type, _max_list_size=None, return_labels=False, lim
           list_labels.append(labels[i].cpu().item())
       graphs_to_writeOnDisk = [gr.toarray() for gr in list_adj]
       np.save('NCI1_lattice_graph.npy', graphs_to_writeOnDisk, allow_pickle=True)
-  elif graph_type=="MUTAG":
+  elif graph_type == "MUTAG":
       data = dgl.data.GINDataset(name='MUTAG', self_loop=False)
       graphs, labels = data.graphs, data.labels
       for i, graph in enumerate(graphs):
@@ -529,7 +540,7 @@ def list_graph_loader( graph_type, _max_list_size=None, return_labels=False, lim
           list_labels.append(labels[i].cpu().item())
       graphs_to_writeOnDisk = [gr.toarray() for gr in list_adj]
       np.save('MUTAG_lattice_graph.npy', graphs_to_writeOnDisk, allow_pickle=True)
-  elif graph_type=="COLLAB":
+  elif graph_type == "COLLAB":
       data = dgl.data.GINDataset(name='COLLAB', self_loop=False)
       graphs, labels = data.graphs, data.labels
       for i, graph in enumerate(graphs):
@@ -539,7 +550,7 @@ def list_graph_loader( graph_type, _max_list_size=None, return_labels=False, lim
           list_labels.append(labels[i].cpu().item())
       graphs_to_writeOnDisk = [gr.toarray() for gr in list_adj]
       # np.save('COLLAB_lattice_graph.npy', graphs_to_writeOnDisk, allow_pickle=True)
-  elif graph_type=="PTC":
+  elif graph_type == "PTC":
       data = dgl.data.GINDataset(name='PTC', self_loop=False)
       graphs, labels = data.graphs, data.labels
       for i, graph in enumerate(graphs):
@@ -570,7 +581,7 @@ def list_graph_loader( graph_type, _max_list_size=None, return_labels=False, lim
           list_x.append(None)
           # list_labels.append(labels[i].cpu().item())
 
-  elif graph_type=="ogbg-molbbbp":
+  elif graph_type == "ogbg-molbbbp":
       # https://ogb.stanford.edu/docs/graphprop/
       from ogb.graphproppred import DglGraphPropPredDataset, collate_dgl
       d_name = "ogbg-molbbbp"  # ogbg-molhiv   'ogbg-code2' ogbg-ppa
@@ -589,31 +600,31 @@ def list_graph_loader( graph_type, _max_list_size=None, return_labels=False, lim
 
 
       # list_labels = [adj.sum() for adj in list_adj]
-  elif graph_type=="large_grid":
+  elif graph_type == "large_grid":
       for i in range(10):
             list_adj.append(nx.adjacency_matrix(grid(30, 100)))
             list_x.append(None)
-  elif graph_type=="grid":
+  elif graph_type == "grid":
       for i in range(10, 20):
         for j in range(10, 20):
             list_adj.append(nx.adjacency_matrix(grid(i, j)))
             list_x.append(None)
 
-  elif graph_type=="triangular_grid":
+  elif graph_type == "triangular_grid":
       for i in range(10, 20):
         for j in range(10, 20):
             list_adj.append(nx.adjacency_matrix(nx.triangular_lattice_graph(i, j)))
             list_x.append(None)
       # graphs_to_writeOnDisk = [gr.toarray() for  gr in list_adj]
       # np.save('triangular_lattice_graph.npy', graphs_to_writeOnDisk, allow_pickle=True)
-  elif graph_type=="small_triangular_grid":
+  elif graph_type == "small_triangular_grid":
       for i in range(6, 12):
         for j in range(6, 12):
             list_adj.append(nx.adjacency_matrix(nx.triangular_lattice_graph(i, j)))
             list_x.append(None)
       # graphs_to_writeOnDisk = [gr.toarray() for  gr in list_adj]
       # np.save('triangular_lattice_graph.npy', graphs_to_writeOnDisk, allow_pickle=True)
-  elif graph_type=="fancy_grid":
+  elif graph_type == "fancy_grid":
       for i in range(4, 8):
         for j in range(4, 8):
             list_adj.append(nx.adjacency_matrix(grid(i, j)))
@@ -634,29 +645,29 @@ def list_graph_loader( graph_type, _max_list_size=None, return_labels=False, lim
       for graph_size in range(3,83):
           list_x.append(None)
           list_adj.append(nx.adjacency_matrix(nx.wheel_graph(graph_size)))
-  elif graph_type=="IMDbMulti":
+  elif graph_type == "IMDbMulti":
       list_adj = pkl.load(open("data/IMDbMulti/IMDBMulti.p",'rb'))
       list_x= [None for x in list_adj]
-  elif graph_type=="one_grid":
+  elif graph_type == "one_grid":
         list_adj.append(nx.adjacency_matrix(grid(350, 10)))
         list_x.append(None)
-  elif graph_type=="small_grid":
+  elif graph_type == "small_grid":
       for i in range(2, 3):
         for j in range(2, 5):
             list_adj.append(nx.adjacency_matrix(grid(i, j)))
             list_x.append(None)
-  elif graph_type=="huge_grids":
+  elif graph_type == "huge_grids":
       for i in range(4, 10):
           for j in range(4, 10):
               list_adj.append(nx.adjacency_matrix(grid(i, j)))
               list_x.append(None)
-  elif graph_type=="community":
+  elif graph_type == "community":
       for i in range(30, 81):
         for j in range(30,81):
             list_adj.append(nx.adjacency_matrix(n_community([i, j], p_inter=0.3, p_intera=0.05)))
             list_x.append(None)
 
-  elif graph_type=="multi_community":
+  elif graph_type == "multi_community":
       for g_i in range(400):
             communities = [random.randint(30, 81) for i in range(random.randint(2, 5))]
             list_adj.append(nx.adjacency_matrix(n_community(communities, p_inter=0.3, p_intera=0.05)))
@@ -762,7 +773,7 @@ def list_graph_loader( graph_type, _max_list_size=None, return_labels=False, lim
       # writing the generated graph for benchmarking
       # graphs_to_writeOnDisk = [gr.toarray() for  gr in list_adj]
       # np.save('Lobster_adj.npy', graphs_to_writeOnDisk, allow_pickle=True)
-  elif graph_type=="mnist":
+  elif graph_type == "mnist":
       list_adj = []
       list_x = []
       import torch_geometric
@@ -1018,7 +1029,7 @@ def BFS_Permute( adj_s, x_s, target_kelrnel_val):
 
   return adj_s, x_s, target_kelrnel_val
 
-def load_neuroimaging_data(data_path):#new
+def load_neuroimaging_data(data_path, site_id = None):#new
     """
     Loads multi-view neuroimaging data (SC, FC) and multi-label CSV.
 
@@ -1032,12 +1043,13 @@ def load_neuroimaging_data(data_path):#new
             - list_labels (list): A list of multi-label numpy arrays.
     """
     print("Loading Multi-view Neuroimaging Dataset...")
-
+    if site_id is None:
+        site_id = 16
     # 1. Load the pickle files
     try:
-        with open(os.path.join(data_path, 'sc_site_16.pkl'), 'rb') as f:
+        with open(os.path.join(data_path, f'sc_site_{site_id}.pkl'), 'rb') as f:
             sc_data = pickle.load(f)
-        with open(os.path.join(data_path, 'fc_site_16.pkl'), 'rb') as f:
+        with open(os.path.join(data_path, f'fc_site_{site_id}.pkl'), 'rb') as f:
             fc_data = pickle.load(f)
     except FileNotFoundError as e:
         print(f"Error: Could not find SC or FC pickle files in '{data_path}'.")
@@ -1045,7 +1057,7 @@ def load_neuroimaging_data(data_path):#new
 
     # 2. Load the labels CSV
     try:
-        labels_df = pd.read_csv(os.path.join(data_path, 'site_16_labels.csv'))
+        labels_df = pd.read_csv(os.path.join(data_path, f'site_{site_id}_labels.csv'))
         # Set the subjectkey as the index for easy lookup
         labels_df.set_index('subjectkey', inplace=True)
     except FileNotFoundError as e:
