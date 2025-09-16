@@ -1249,7 +1249,7 @@ if __name__ == '__main__':
     import plotter
 
     result = list_graph_loader("PVGAErandomGraphs")
-    graph = np.load('C:\git\GRANon13\data/PVGAErandomGraphs.npy', allow_pickle=True)
+    graph = np.load(r'C:\git\GRANon13\data/PVGAErandomGraphs.npy', allow_pickle=True)
 
 
     result = list_graph_loader("PVGAErandomGraphs_100000")
