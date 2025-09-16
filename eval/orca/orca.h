@@ -1342,7 +1342,7 @@ fstream fin, fout; // input and output files
 int GS=5;
 string orbit_type;
 
-int motif_counts(char* orbit_type, int graphlet_size, const char* input_filename, const char* output_filename) {
+int motif_counts(const char* orbit_type, int graphlet_size, const char* input_filename, const char* output_filename) {
     // open input, output files
     if (strcmp(orbit_type, "node")!=0 && strcmp(orbit_type, "edge")!=0) {
         cerr << "Incorrect orbit type '" << orbit_type << "'. Should be 'node' or 'edge'." << endl;
@@ -1435,7 +1435,7 @@ int init(int argc, char *argv[]) {
     }
     int graphlet_size;
     sscanf(argv[2],"%d", &graphlet_size);
-    motif_counts(argv[1], graphlet_size, argv[3], argv[4]);
+    return motif_counts(argv[1], graphlet_size, argv[3], argv[4]);
 }
 
 void writeResults(int g=5) {
