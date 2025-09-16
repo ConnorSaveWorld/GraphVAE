@@ -946,16 +946,16 @@ if __name__ == '__main__':
     parser.add_argument('-e', dest="epoch_number", default=100, type=int)  # Reduced epochs
     parser.add_argument('-lr', dest="lr", default=1e-3, type=float)        # Higher learning rate
     parser.add_argument('-batchSize', dest="batchSize", default=8, type=int) # Larger batch for stability
-    parser.add_argument('-device', dest="device", default="cuda:0")
+    parser.add_argument('-device', dest="device", default="cuda:1")
     parser.add_argument('-graphEmDim', dest="graphEmDim", default= 768, type=int) # Increased embedding dim
-    parser.add_argument('-dataset', dest="dataset", default="PPMI")
+    parser.add_argument('-dataset', dest="dataset", default="neuro")
     parser.add_argument('-num_views', dest="num_views", default=2, type=int)
     args = parser.parse_args()
 
     # --- Setup ---
-    random.seed(42)
-    np.random.seed(42)
-    torch.manual_seed(42)
+    random.seed(2)
+    np.random.seed(2)
+    torch.manual_seed(2)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"--- Using device: {device} ---")
     os.makedirs(f'ckpt/{args.dataset}', exist_ok=True)
@@ -1063,7 +1063,7 @@ if __name__ == '__main__':
     best_test_auc = 0.0
     best_epoch = 0
     patience_counter = 0
-    patience = 25  # Reduced patience for faster iteration
+    patience = 20  # Reduced patience for faster iteration
     checkpoint_dir = f"ckpt/{args.dataset}_stage1"
     os.makedirs(checkpoint_dir, exist_ok=True)
     best_model_path = os.path.join(checkpoint_dir, "best_stage1_model.pt")
