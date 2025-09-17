@@ -506,7 +506,7 @@ def list_graph_loader(graph_type, _max_list_size=None, return_labels=False, limi
   elif graph_type_lower == "ppmi":
     list_adj, list_x, list_labels = load_PPMI("/root/GraphVAE-MM/dataset/PPMI")
   elif graph_type_lower == "neuro":
-    list_adj, list_x, list_labels = load_neuroimaging_data("/home/jinghu/diffusion/GraphVAE/dataset/Neuro", site_id=16)
+    list_adj, list_x, list_labels = load_neuroimaging_data("/home/jinghu/diffusion/FVDM/GraphVAE/dataset/Neuro", site_id=16)
 
 
   elif graph_type == "IMDBBINARY":

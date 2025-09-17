@@ -1036,29 +1036,29 @@ if __name__ == '__main__':
     vae_decoder = ClassificationDecoder(args.graphEmDim, 768, 1, dropout_rate=0.3)  # Reduced capacity + more dropout
     vae_model = StagedSupervisedVAE(vae_encoder, vae_decoder).to(device)
     
-    # # More conservative optimizer settings
-    # optimizer_vae = torch.optim.AdamW(vae_model.parameters(), lr=args.lr * 0.5, weight_decay=1e-3, betas=(0.9, 0.999))
+    # More conservative optimizer settings
+    optimizer_vae = torch.optim.AdamW(vae_model.parameters(), lr=args.lr * 0.5, weight_decay=1e-3, betas=(0.9, 0.999))
     
-    # # Cosine annealing with warmup for better convergence
-    # total_steps = (len(train_data.list_adjs) // args.batchSize) * args.epoch_number
-    # warmup_steps = total_steps // 10  # 10% warmup
+    # Cosine annealing with warmup for better convergence
+    total_steps = (len(train_data.list_adjs) // args.batchSize) * args.epoch_number
+    warmup_steps = total_steps // 10  # 10% warmup
     
-    # def lr_lambda(step):
-    #     if step < warmup_steps:
-    #         return step / warmup_steps
-    #     else:
-    #         progress = (step - warmup_steps) / (total_steps - warmup_steps)
-    #         return 0.5 * (1 + np.cos(np.pi * progress))
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / warmup_steps
+        else:
+            progress = (step - warmup_steps) / (total_steps - warmup_steps)
+            return 0.5 * (1 + np.cos(np.pi * progress))
     
-    # scheduler_vae = torch.optim.lr_scheduler.LambdaLR(optimizer_vae, lr_lambda)
+    scheduler_vae = torch.optim.lr_scheduler.LambdaLR(optimizer_vae, lr_lambda)
 
-    # # More conservative KL annealing parameters
-    # kl_beta = 0.0
-    # kl_anneal_epochs = 100  # Much longer annealing period
-    # steps_per_epoch = max(1, len(train_data.list_adjs) // args.batchSize)
-    # kl_anneal_steps = steps_per_epoch * kl_anneal_epochs
-    # kl_anneal_rate = 0.5 / kl_anneal_steps if kl_anneal_steps > 0 else 0.5  # Slower annealing to max 0.5
-    # print(f"KL Annealing will occur over the first {kl_anneal_epochs} epochs to max beta=0.5.")
+    # More conservative KL annealing parameters
+    kl_beta = 0.0
+    kl_anneal_epochs = 100  # Much longer annealing period
+    steps_per_epoch = max(1, len(train_data.list_adjs) // args.batchSize)
+    kl_anneal_steps = steps_per_epoch * kl_anneal_epochs
+    kl_anneal_rate = 0.5 / kl_anneal_steps if kl_anneal_steps > 0 else 0.5  # Slower annealing to max 0.5
+    print(f"KL Annealing will occur over the first {kl_anneal_epochs} epochs to max beta=0.5.")
 
     best_test_auc = 0.0
     best_epoch = 0
@@ -1068,112 +1068,112 @@ if __name__ == '__main__':
     os.makedirs(checkpoint_dir, exist_ok=True)
     best_model_path = os.path.join(checkpoint_dir, "best_stage1_model.pt")
 
-    # print("\n--- Starting Stage 1: Supervised Pre-training ---")
-    # for epoch in range(args.epoch_number):
-    #     vae_model.train()
-    #     train_data.shuffle()
+    print("\n--- Starting Stage 1: Supervised Pre-training ---")
+    for epoch in range(args.epoch_number):
+        vae_model.train()
+        train_data.shuffle()
         
-    #     epoch_total_loss, epoch_class_loss, epoch_kl_loss = 0, 0, 0
-    #     num_batches = 0
+        epoch_total_loss, epoch_class_loss, epoch_kl_loss = 0, 0, 0
+        num_batches = 0
 
-    #     for i in range(0, len(train_data.list_adjs), args.batchSize):
-    #         from_ = i
-    #         to_ = i + args.batchSize
+        for i in range(0, len(train_data.list_adjs), args.batchSize):
+            from_ = i
+            to_ = i + args.batchSize
             
-    #         # Get batch data with labels
-    #         adj_batch, x_batch, _, _, _, labels_batch = train_data.get__(from_, to_, self_for_none=True, get_labels=True)
-    #         target_labels = torch.tensor(labels_batch, device=device)
+            # Get batch data with labels
+            adj_batch, x_batch, _, _, _, labels_batch = train_data.get__(from_, to_, self_for_none=True, get_labels=True)
+            target_labels = torch.tensor(labels_batch, device=device)
 
-    #         # Prepare inputs for the model
-    #         x_s_tensor = torch.stack(x_batch).to(device)
-    #         features_for_dgl = x_s_tensor.view(-1, in_feature_dim)
+            # Prepare inputs for the model
+            x_s_tensor = torch.stack(x_batch).to(device)
+            features_for_dgl = x_s_tensor.view(-1, in_feature_dim)
             
-    #         dgl_graphs_per_view = []
-    #         for v in range(args.num_views):
-    #             view_graphs_in_batch = [dgl.from_scipy(sp.csr_matrix(g[v].cpu().numpy())) for g in adj_batch]
-    #             dgl_graphs_per_view.append(dgl.batch(view_graphs_in_batch).to(device))
+            dgl_graphs_per_view = []
+            for v in range(args.num_views):
+                view_graphs_in_batch = [dgl.from_scipy(sp.csr_matrix(g[v].cpu().numpy())) for g in adj_batch]
+                dgl_graphs_per_view.append(dgl.batch(view_graphs_in_batch).to(device))
             
-    #         batchSize_info = [len(adj_batch), adj_batch[0].shape[-1]]
+            batchSize_info = [len(adj_batch), adj_batch[0].shape[-1]]
 
-    #         # Update KL Beta (slower annealing to prevent collapse)
-    #         if kl_beta < 0.5:
-    #             kl_beta = min(0.5, kl_beta + kl_anneal_rate)
+            # Update KL Beta (slower annealing to prevent collapse)
+            if kl_beta < 0.5:
+                kl_beta = min(0.5, kl_beta + kl_anneal_rate)
 
-    #         # Forward pass, loss calculation, backward pass
-    #         optimizer_vae.zero_grad()
-    #         predicted_logits, mean, log_std, _ = vae_model(dgl_graphs_per_view, features_for_dgl, batchSize_info)
-    #         total_loss, class_loss, kl_loss = SupervisedVAELoss(predicted_logits, target_labels, mean, log_std, kl_beta)
+            # Forward pass, loss calculation, backward pass
+            optimizer_vae.zero_grad()
+            predicted_logits, mean, log_std, _ = vae_model(dgl_graphs_per_view, features_for_dgl, batchSize_info)
+            total_loss, class_loss, kl_loss = SupervisedVAELoss(predicted_logits, target_labels, mean, log_std, kl_beta)
             
-    #         total_loss.backward()
-    #         # More aggressive gradient clipping for stability
-    #         torch.nn.utils.clip_grad_norm_(vae_model.parameters(), max_norm=0.5)
-    #         optimizer_vae.step()
-    #         scheduler_vae.step()  # Step-wise learning rate update
+            total_loss.backward()
+            # More aggressive gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(vae_model.parameters(), max_norm=0.5)
+            optimizer_vae.step()
+            scheduler_vae.step()  # Step-wise learning rate update
 
-    #         epoch_total_loss += total_loss.item()
-    #         epoch_class_loss += class_loss.item()
-    #         epoch_kl_loss += kl_loss.item()
-    #         num_batches += 1
+            epoch_total_loss += total_loss.item()
+            epoch_class_loss += class_loss.item()
+            epoch_kl_loss += kl_loss.item()
+            num_batches += 1
 
-    #     # End of epoch evaluation
-    #     avg_total_loss = epoch_total_loss / num_batches
-    #     avg_class_loss = epoch_class_loss / num_batches
-    #     avg_kl_loss = epoch_kl_loss / num_batches
+        # End of epoch evaluation
+        avg_total_loss = epoch_total_loss / num_batches
+        avg_class_loss = epoch_class_loss / num_batches
+        avg_kl_loss = epoch_kl_loss / num_batches
         
-    #     # Evaluate on test set
-    #     vae_model.eval()
-    #     all_preds, all_labels = [], []
-    #     with torch.no_grad():
-    #         for i_test in range(0, len(test_data.list_adjs), args.batchSize):
-    #             from_test = i_test
-    #             to_test = i_test + args.batchSize
+        # Evaluate on test set
+        vae_model.eval()
+        all_preds, all_labels = [], []
+        with torch.no_grad():
+            for i_test in range(0, len(test_data.list_adjs), args.batchSize):
+                from_test = i_test
+                to_test = i_test + args.batchSize
                 
-    #             adj_test, x_test, _, _, _, labels_test = test_data.get__(from_test, to_test, self_for_none=True, get_labels=True)
+                adj_test, x_test, _, _, _, labels_test = test_data.get__(from_test, to_test, self_for_none=True, get_labels=True)
                 
-    #             x_s_tensor_test = torch.stack(x_test).to(device)
-    #             features_dgl_test = x_s_tensor_test.view(-1, in_feature_dim)
-    #             dgl_views_test = [dgl.batch([dgl.from_scipy(sp.csr_matrix(g[v].cpu().numpy())) for g in adj_test]).to(device) for v in range(args.num_views)]
-    #             batchSize_info_test = [len(adj_test), adj_test[0].shape[-1]]
+                x_s_tensor_test = torch.stack(x_test).to(device)
+                features_dgl_test = x_s_tensor_test.view(-1, in_feature_dim)
+                dgl_views_test = [dgl.batch([dgl.from_scipy(sp.csr_matrix(g[v].cpu().numpy())) for g in adj_test]).to(device) for v in range(args.num_views)]
+                batchSize_info_test = [len(adj_test), adj_test[0].shape[-1]]
 
-    #             _, mean_test, _, _ = vae_model(dgl_views_test, features_dgl_test, batchSize_info_test)
-    #             test_logits = vae_model.decoder(mean_test)
+                _, mean_test, _, _ = vae_model(dgl_views_test, features_dgl_test, batchSize_info_test)
+                test_logits = vae_model.decoder(mean_test)
                 
-    #             all_preds.append(torch.sigmoid(test_logits).cpu())
-    #             all_labels.append(torch.tensor(labels_test))
+                all_preds.append(torch.sigmoid(test_logits).cpu())
+                all_labels.append(torch.tensor(labels_test))
 
-    #     all_preds = torch.cat(all_preds).numpy().ravel()
-    #     all_labels = torch.cat(all_labels).numpy().ravel()
-    #     auc = roc_auc_score(all_labels, all_preds)
+        all_preds = torch.cat(all_preds).numpy().ravel()
+        all_labels = torch.cat(all_labels).numpy().ravel()
+        auc = roc_auc_score(all_labels, all_preds)
 
-    #     if auc > best_test_auc:
-    #         best_test_auc = auc
-    #         best_epoch = epoch + 1
-    #         patience_counter = 0
-    #         torch.save({
-    #             'epoch': epoch,
-    #             'model_state_dict': vae_model.state_dict(),
-    #             'optimizer_state_dict': optimizer_vae.state_dict(),
-    #             'scheduler_state_dict': scheduler_vae.state_dict(),
-    #             'test_auc': auc,
-    #             'kl_beta': kl_beta,
-    #             'args': args
-    #         }, best_model_path)
-    #         print(f"  *** New best model saved! Best AUC: {best_test_auc:.4f} at epoch {best_epoch} ***")
-    #     else:
-    #         patience_counter += 1
+        if auc > best_test_auc:
+            best_test_auc = auc
+            best_epoch = epoch + 1
+            patience_counter = 0
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': vae_model.state_dict(),
+                'optimizer_state_dict': optimizer_vae.state_dict(),
+                'scheduler_state_dict': scheduler_vae.state_dict(),
+                'test_auc': auc,
+                'kl_beta': kl_beta,
+                'args': args
+            }, best_model_path)
+            print(f"  *** New best model saved! Best AUC: {best_test_auc:.4f} at epoch {best_epoch} ***")
+        else:
+            patience_counter += 1
             
-    #     # Early stopping
-    #     if patience_counter >= patience:
-    #         print(f"Early stopping at epoch {epoch+1}. No improvement for {patience} epochs.")
-    #         break
+        # Early stopping
+        if patience_counter >= patience:
+            print(f"Early stopping at epoch {epoch+1}. No improvement for {patience} epochs.")
+            break
 
-    #     print(f"Epoch: {epoch+1:03d} | Avg Loss: {avg_total_loss:.4f} | Class Loss: {avg_class_loss:.4f} | "
-    #           f"KL Loss: {avg_kl_loss:.4f} | Beta: {kl_beta:.3f} | Test AUC: {auc:.4f} | LR: {optimizer_vae.param_groups[0]['lr']:.2e}")
+        print(f"Epoch: {epoch+1:03d} | Avg Loss: {avg_total_loss:.4f} | Class Loss: {avg_class_loss:.4f} | "
+              f"KL Loss: {avg_kl_loss:.4f} | Beta: {kl_beta:.3f} | Test AUC: {auc:.4f} | LR: {optimizer_vae.param_groups[0]['lr']:.2e}")
 
-    # print("--- STAGE 1 Finished. VAE model is ready. ---")
-    # # Clean up optimizer memory
-    # del optimizer_vae, scheduler_vae
-    # torch.cuda.empty_cache()
+    print("--- STAGE 1 Finished. VAE model is ready. ---")
+    # Clean up optimizer memory
+    del optimizer_vae, scheduler_vae
+    torch.cuda.empty_cache()
     
     # Load the best model
     if os.path.exists(best_model_path):
@@ -1182,10 +1182,44 @@ if __name__ == '__main__':
         vae_model.load_state_dict(checkpoint['model_state_dict'])
         print(f"Loaded model from epoch {checkpoint['epoch']+1} with test AUC: {checkpoint['test_auc']:.4f}")
     else:
-        print("WARNING: No best model checkpoint found. Using final model state.")
-    
-    
-    
+        print(
+            "Stage 1 checkpoint not found. Please train the VAE (uncomment Stage 1 training) before running Stage 2."
+        )
+
+    def _extract_vae_graph_embeddings(vae_model, dataset_obj, dgl_multiview_list):
+        vae_model.eval()
+        embeddings, labels = [], []
+        with torch.no_grad():
+            for i in range(len(dataset_obj)):
+                x = [dataset_obj.x_s[i].to_dense().clone().detach()]
+                x_tensor = torch.stack(x).to(device)
+                features_dgl = x_tensor.view(-1, in_feature_dim)
+                dgl_views = [dgl.batch([dgl_multiview_list[i][v]]).to(device) for v in range(args.num_views)]
+                _, graph_mean, _ = vae_model.encoder(dgl_views, features_dgl, [1, x[0].shape[0]])
+                embeddings.append(graph_mean.view(-1).cpu().numpy())
+                labels.append(dataset_obj.labels[i])
+        return np.stack(embeddings), np.array(labels)
+
+    def run_vae_logistic_probe():
+        X_train, y_train = _extract_vae_graph_embeddings(vae_model, train_data, train_dgl_multiview)
+        X_test, y_test = _extract_vae_graph_embeddings(vae_model, test_data, test_dgl_multiview)
+        if len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 2:
+            print("Insufficient class diversity for logistic probe; skipping evaluation.")
+            return None
+        clf = LogisticRegression(max_iter=1000, class_weight='balanced', solver='lbfgs', random_state=42)
+        clf.fit(X_train, y_train)
+        test_scores = clf.predict_proba(X_test)[:, 1]
+        test_preds = (test_scores >= 0.5).astype(int)
+        auc = roc_auc_score(y_test, test_scores)
+        acc = accuracy_score(y_test, test_preds)
+        f1 = f1_score(y_test, test_preds, zero_division=0)
+        print(f"VAE logistic probe -> AUC: {auc:.4f}, ACC: {acc:.4f}, F1: {f1:.4f}")
+        if auc < 0.6:
+            print("Warning: VAE embeddings show weak discrimination (AUC < 0.6). Consider retraining Stage 1.")
+        return auc
+
+    _ = run_vae_logistic_probe()
+
     # ========================================================================
     # BRIDGE: GENERATE DDM-READY DATASET FROM VAE EMBEDDINGS
     # ========================================================================
@@ -1204,8 +1238,8 @@ if __name__ == '__main__':
         # Get views
             dgl_views = [dgl.batch([dgl_multiview_list[i][v]]).to(device) for v in range(args.num_views)]
         
-        # Get graph-level embedding from VAE encoder
-            _, graph_embedding, log_std = vae_model.encoder(dgl_views, features_dgl, [1, x[0].shape[0]])
+        # Get node-level and graph-level embeddings from the VAE encoder
+            node_embeddings, graph_embedding, log_std = vae_model.encoder(dgl_views, features_dgl, [1, x[0].shape[0]])
 
         # Enhanced node features: Use graph embedding + structural information
             dgl_graph_for_ddm = dgl_multiview_list[i][0] # Use first view's structure
@@ -1228,8 +1262,8 @@ if __name__ == '__main__':
         # 3. Node position as fraction of graph size
             position_encoding = torch.arange(0, num_nodes, device=device).float().unsqueeze(1) / max(1, num_nodes)
         
-        # Create embeddings for nodes with graph-level context and structural properties
-            node_features = graph_embedding.expand(num_nodes, -1).clone()  # Clone to avoid memory issues
+        # Start from the encoder's node embeddings
+            node_features = node_embeddings.clone()
         
         # Create structural feature vector
             structural_features = torch.cat([
@@ -1241,7 +1275,7 @@ if __name__ == '__main__':
             ], dim=1)
         
         # Project structural features to partial embedding dimension
-            feature_dim = graph_embedding.shape[-1]
+            feature_dim = node_features.shape[-1]
             proj_dim = min(feature_dim // 4, 32)  # Use at most 1/4 of dimensions
         
         # Simple projection of structural features
@@ -1253,12 +1287,12 @@ if __name__ == '__main__':
             # Subsample
                 structural_projected = structural_features[:, :proj_dim]
         
-        # Scale structural features
-            structural_weight = 0.2  # Balance between structure and semantic
-        
-        # Apply structural modifications to a portion of features
-            if feature_dim >= proj_dim:
-                node_features[:, :proj_dim] = node_features[:, :proj_dim] * (1 - structural_weight) + structural_projected * structural_weight
+        # Scale structural features (residual injection keeps VAE signal dominant)
+            structural_weight = 0.05
+
+        # Apply structural signal as a light residual on the first projection block
+            if proj_dim > 0 and feature_dim >= proj_dim:
+                node_features[:, :proj_dim] = node_features[:, :proj_dim] + structural_projected * structural_weight
             
         # Add controlled noise based on VAE uncertainty
             uncertainty_scale = min(0.1, max(0.01, torch.exp(log_std).mean().item()))
@@ -1610,4 +1644,3 @@ try:
     visualize_tsne_classification(model_for_vis, ddm_train_loader, ddm_test_loader, tsne_T, device)
 except Exception as e:
     print(f"t-SNE visualisation failed: {e}")
-
